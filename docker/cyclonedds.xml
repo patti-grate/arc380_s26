@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CycloneDDS configuration for ROS 2 running inside Docker on Windows.
+
+  - Enables unicast peer discovery to "host.docker.internal" so that ROS 2
+    nodes running on the Windows host (or in WSL 2) can communicate with
+    nodes running inside this container.
+  - Multicast is left at "default" so same-container discovery still works.
+-->
+<CycloneDDS
+    xmlns="https://cdds.io/config"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="true" priority="default" multicast="default"/>
+      </Interfaces>
+    </General>
+    <Discovery>
+      <!--
+        Add the Windows host as a unicast peer.
+        Docker Desktop injects "host.docker.internal" → host IP automatically.
+        If running ROS 2 on a separate machine, add its IP here too.
+      -->
+      <Peers>
+        <Peer address="host.docker.internal"/>
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+    </Discovery>
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

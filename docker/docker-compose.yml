@@ -1,0 +1,46 @@
+services:
+  ros2_sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: arc380_ros2:latest
+    container_name: arc380_ros2
+    ports:
+      - "6080:6080"   # noVNC web interface  →  http://localhost:6080/vnc.html
+      - "5900:5900"   # VNC direct access    →  localhost:5900 (no password)
+    environment:
+      - DISPLAY=:1
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - CYCLONEDDS_URI=/cyclonedds.xml
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - GALLIUM_DRIVER=llvmpipe
+      - QT_X11_NO_MITSHM=1
+    # Allows "host.docker.internal" to resolve inside the container on Linux hosts.
+    # On Windows/macOS Docker Desktop this is injected automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Shared memory — improves DDS performance
+    ipc: host
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Build & start:
+#    cd docker
+#    docker compose up --build
+#
+#  Open GUI in browser:
+#    http://localhost:6080/vnc.html
+#
+#  Open a shell inside the container (e.g., to run Python scripts):
+#    docker exec -it arc380_ros2 bash
+#      then:  source /opt/ros/jazzy/setup.bash
+#             source /ros2_ws/install/setup.bash
+#             python3 your_script.py
+#
+#  Stop:
+#    docker compose down

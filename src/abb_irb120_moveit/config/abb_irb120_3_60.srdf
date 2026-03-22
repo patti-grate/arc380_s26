@@ -14,7 +14,6 @@
     </group>
     <group name="gripper">
         <joint name="left_finger_joint"/>
-        <joint name="right_finger_joint"/>
     </group>
     <group name="manipulator">
         <chain base_link="base_link" tip_link="gripper_tcp"/>
@@ -38,11 +37,9 @@
     </group_state>
     <group_state name="open" group="gripper">
         <joint name="left_finger_joint" value="0.00"/>
-        <joint name="right_finger_joint" value="0.00"/>
     </group_state>
     <group_state name="closed" group="gripper">
         <joint name="left_finger_joint" value="0.01"/>
-        <joint name="right_finger_joint" value="0.01"/>
     </group_state>
     <end_effector name="gripper_ee" parent_link="tool0" group="gripper"/>
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->

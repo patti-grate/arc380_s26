@@ -9,7 +9,7 @@ controller_manager:
       type: joint_trajectory_controller/JointTrajectoryController
 
     gripper_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
+      type: parallel_gripper_action_controller/GripperActionController
 
 arm_controller:
   ros__parameters:
@@ -45,11 +45,12 @@ arm_controller:
 
 gripper_controller:
   ros__parameters:
-    joints:
-      - left_finger_joint
-      - right_finger_joint
-    command_interfaces:
-      - position
+    joint: left_finger_joint
     state_interfaces:
       - position
       - velocity
+    action_monitor_rate: 20.0
+    goal_tolerance: 0.0005
+    allow_stalling: true
+    stall_velocity_threshold: 0.001
+    stall_timeout: 0.5

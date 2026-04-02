@@ -219,8 +219,8 @@ def ros_sensor_to_egm(sensor_msg: EgmSensor, *, ext_joint_types: list[str] | Non
 
     planned_headers = []
     if sensor_msg.mode == EgmSensor.MODE_JOINTS:
-        if len(sensor_msg.planned_joints.position) != 6:
-            raise ValueError("Expected 6 joint positions for MODE_JOINTS")
+        if len(sensor_msg.planned_joints.position) < 6:
+            raise ValueError("Expected at least 6 joint positions for MODE_JOINTS")
         egm_sensor.planned.joints.CopyFrom(ros_joints_to_egm(sensor_msg.planned_joints))
         planned_headers.append(sensor_msg.planned_joints.header)
     if sensor_msg.mode == EgmSensor.MODE_CARTESIAN:
@@ -260,7 +260,8 @@ def ros_sensor_to_egm(sensor_msg: EgmSensor, *, ext_joint_types: list[str] | Non
         egm_sensor.speedRef.externalJoints.joints.extend(speed_ref_ext_joints)
 
     if sensor_msg.send_rapid_data:
-        egm_sensor.RAPIDtoRobot.digVal = bool(sensor_msg.rapid_dig_val)
+        # TODO: Configure once \DIFromSensor is working in RAPID
+        # egm_sensor.RAPIDtoRobot.digVal = bool(sensor_msg.rapid_dig_val)
         if sensor_msg.rapid_dnum:
-            egm_sensor.RAPIDtoRobot.dnum = list(sensor_msg.rapid_dnum)
+            egm_sensor.RAPIDtoRobot.dnum.extend(sensor_msg.rapid_dnum)
     return egm_sensor

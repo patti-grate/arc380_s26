@@ -17,11 +17,13 @@ class ControlSpace(Enum):
 
 @dataclass
 class ControllerConfig:
-    udp_port: int = 6512
+    udp_port: int = 6510
     control_space: ControlSpace = ControlSpace.JOINT
     robot_joint_names: list[str] = field(default_factory=lambda: list(DEFAULT_JOINT_NAMES))
     ext_joint_names: list[str] = field(default_factory=lambda: list(DEFAULT_EXT_JOINT_NAMES))
     ext_joint_types: list[str] = field(default_factory=lambda: list(DEFAULT_EXT_JOINT_TYPES))
+    docker_mode: bool = False
+    relay_port_out: int = 6512
 
     def __setattr__(self, key, value):
         parsed_value = PARAM_SPECS[key].parser(value) if key in PARAM_SPECS else value
@@ -134,5 +136,19 @@ PARAM_SPECS = {
             type=Parameter.Type.STRING_ARRAY,
         ),
         parser=_parse_ext_joint_types,
+    ),
+    "docker_mode": ParamSpec(
+        descriptor=ParameterDescriptor(
+            description="Whether to operate in Docker relay mode (true) or direct control mode (false).",
+            type=Parameter.Type.BOOL,
+        ),
+        parser=lambda value: bool(value),
+    ),
+    "relay_port_out": ParamSpec(
+        descriptor=ParameterDescriptor(
+            description="UDP port to send EGM messages to the relay (only used in Docker relay mode)",
+            type=Parameter.Type.INTEGER,
+        ),
+        parser=_parse_udp_port,
     ),
 }

@@ -1,8 +1,9 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
 from moveit_configs_utils import MoveItConfigsBuilder
-import os
 
 
 def generate_launch_description():
@@ -25,16 +26,21 @@ def generate_launch_description():
         package="abb_egm_controller",
         executable="egm",
         name="egm_controller",
-        parameters=[],
+        parameters=[
+            {
+                "udp_port": 6511,
+                "docker_mode": True,
+                "relay_port_out": 6512,
+            }
+        ],
         output="screen",
-    ),
+    )
 
     rsp = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
         parameters=[
             moveit_config.robot_description,
-            {"use_sim_time": True},
         ],
         output="screen",
     )
@@ -45,29 +51,29 @@ def generate_launch_description():
         output="screen",
         parameters=[
             moveit_config.to_dict(),
-            {"use_sim_time": True},
         ],
     )
 
-    rviz = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        output="screen",
-        arguments=["-d", rviz_config_file],
-        parameters=[
-            moveit_config.robot_description,
-            moveit_config.robot_description_semantic,
-            moveit_config.robot_description_kinematics,
-            moveit_config.planning_pipelines,
-            moveit_config.joint_limits,
-            {"use_sim_time": True},
-        ],
-    )
+    # rviz = Node(
+    #     package="rviz2",
+    #     executable="rviz2",
+    #     name="rviz2",
+    #     output="screen",
+    #     arguments=["-d", rviz_config_file],
+    #     parameters=[
+    #         moveit_config.robot_description,
+    #         moveit_config.robot_description_semantic,
+    #         moveit_config.robot_description_kinematics,
+    #         moveit_config.planning_pipelines,
+    #         moveit_config.joint_limits,
+    #     ],
+    # )
 
-    return LaunchDescription([
-        rsp,
-        egm_controller,
-        move_group,
-        rviz,
-    ])
+    return LaunchDescription(
+        [
+            rsp,
+            egm_controller,
+            move_group,
+            # rviz,
+        ]
+    )

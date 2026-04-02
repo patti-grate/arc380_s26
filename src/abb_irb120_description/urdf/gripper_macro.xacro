@@ -109,5 +109,12 @@
         <origin xyz="0 0 0.1353" rpy="0 0 0"/>
     </joint>
 
+    <link name="${prefix}gripper_tcp_calibrated"/>
+    <joint name="${prefix}gripper_base-gripper_tcp_calibrated" type="fixed">
+        <parent link="${prefix}gripper_base"/>
+        <child link="${prefix}gripper_tcp_calibrated"/>
+        <origin xyz="0 0 0.139" rpy="0 0 ${radians(45)}"/>
+    </joint>
+
   </xacro:macro>
 </robot>

@@ -1,44 +1,34 @@
+x-ros2-common: &ros2-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: arc380_ros2:latest
+  network_mode: host
+
+  volumes:
+    - ../workshops:/workshops
+    - ../scripts:/scripts
+
+  environment:
+    - DISPLAY=:1
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - CYCLONEDDS_URI=/cyclonedds.xml
+    - LIBGL_ALWAYS_SOFTWARE=1
+    - GALLIUM_DRIVER=llvmpipe
+    - QT_X11_NO_MITSHM=1
+
+  ipc: host
+  stdin_open: true
+  tty: true
+  restart: unless-stopped
+
 services:
   ros2_sim:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: arc380_ros2:latest
+    <<: *ros2-common
     container_name: arc380_ros2
-    network_mode: host
+    # no command override, so entrypoint.sh runs simulation by default
 
-    volumes:
-      - ../workshops:/workshops
-      - ../scripts:/scripts
-
-    environment:
-      - DISPLAY=:1
-      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-      - CYCLONEDDS_URI=/cyclonedds.xml
-      - LIBGL_ALWAYS_SOFTWARE=1
-      - GALLIUM_DRIVER=llvmpipe
-      - QT_X11_NO_MITSHM=1
-
-    # Shared memory — improves DDS performance
-    ipc: host
-    stdin_open: true
-    tty: true
-    restart: unless-stopped
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Usage
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#  Build & start:
-#    cd docker
-#    docker compose up --build
-#
-#  Open GUI in browser:
-#    http://localhost:6080/vnc.html
-#
-#  Open a shell inside the container (e.g., to run Python scripts):
-#    docker exec -it arc380_ros2 bash
-#      then:  python3 your_script.py
-#
-#  Stop:
-#    docker compose down
+  ros2_real:
+    <<: *ros2-common
+    container_name: arc380_ros2_real
+    command: ros2 launch abb_egm_controller egm_controller.launch.py

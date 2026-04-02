@@ -17,10 +17,10 @@ def main() -> int:
     parser.add_argument("--robot-listen-port", type=int, default=6510)
 
     parser.add_argument("--container-listen-ip", default="127.0.0.1")
-    parser.add_argument("--container-listen-port", type=int, default=6511)
+    parser.add_argument("--container-listen-port", type=int, default=6512)
 
     parser.add_argument("--container-dst-ip", default="127.0.0.1")
-    parser.add_argument("--container-dst-port", type=int, default=6512)
+    parser.add_argument("--container-dst-port", type=int, default=6511)
 
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

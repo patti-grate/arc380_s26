@@ -1,20 +1,23 @@
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
-from rclpy.node import Node
-from rclpy.action import ActionClient
-from abb_egm_interfaces.action import ExecuteTrajectory
-import rclpy
+import time
 from math import pi
 
+import rclpy
+from builtin_interfaces.msg import Duration
+from example_interfaces.srv import SetBool
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from abb_egm_interfaces.action import ExecuteTrajectory
 
 trajectory = JointTrajectory()
 trajectory.joint_names = [f"joint_{i + 1}" for i in range(6)]
 point = JointTrajectoryPoint()
-point.positions = [0.0, 0.0, 0.0, 0.0, pi/2, 0.0]
+point.positions = [0.0, 0.0, 0.0, 0.0, pi / 2, 0.0]
 point.time_from_start = Duration(sec=0, nanosec=0)
 trajectory.points.append(point)
 point = JointTrajectoryPoint()
-point.positions = [0.5, 0.1, 0.1, 0.1, pi/2 + 0.1, 0.1]
+point.positions = [0.5, 0.1, 0.1, 0.1, pi / 2 + 0.1, 0.1]
 point.time_from_start = Duration(sec=2, nanosec=0)
 trajectory.points.append(point)
 
@@ -37,6 +40,7 @@ def main():
     node = Node("egm_test_node")
 
     action_client = ActionClient(node, ExecuteTrajectory, "execute_trajectory")
+    gripper_client = node.create_client(SetBool, "/egm_controller/control/set_gripper")
 
     print("Waiting for execute_trajectory action server...")
     while not action_client.wait_for_server(timeout_sec=0.1):
@@ -64,7 +68,29 @@ def main():
         rclpy.spin_once(node)
     result = result_future.result()
 
-    print(f"Done. success={result.result.success}  error_code={result.result.error_code}  message='{result.result.message}'")
+    print(
+        f"Done. success={result.result.success}  error_code={result.result.error_code}  message='{result.result.message}'"
+    )
+
+    while not gripper_client.wait_for_service(timeout_sec=1.0):
+        print("Waiting for gripper control service...")
+
+    print("Closing gripper...")
+    req = SetBool.Request()
+    req.data = True  # Close gripper
+    future = gripper_client.call_async(req)
+    rclpy.spin_until_future_complete(node, future)
+    resp = future.result()
+    print(f"Gripper control response: success={resp.success}  message='{resp.message}'")
+    time.sleep(1.0)
+
+    print("Opening gripper...")
+    req.data = False  # Open gripper
+    future = gripper_client.call_async(req)
+    rclpy.spin_until_future_complete(node, future)
+    resp = future.result()
+    print(f"Gripper control response: success={resp.success}  message='{resp.message}'")
+    time.sleep(1.0)
 
     rclpy.shutdown()
 

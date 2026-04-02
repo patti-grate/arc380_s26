@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import socket
 import time
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import Event, Lock, Thread
 
@@ -11,73 +12,47 @@ from abb_egm_interfaces.action import ExecuteTrajectory
 from abb_egm_interfaces.msg import EgmRobot, EgmSensor, RobotJointState, RobotPoseState
 from abb_egm_interfaces.srv import SetControlMode
 from builtin_interfaces.msg import Duration
+from example_interfaces.srv import SetBool
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import ServerGoalHandle
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from abb_egm_controller import egm_pb2 as egm
-from abb_egm_controller.msg_conversion import egm_robot_to_ros, ros_sensor_to_egm
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from rcl_interfaces.msg import SetParametersResult
-from abb_egm_controller.egm_config import ControllerConfig, ControlSpace, PARAM_SPECS
-from dataclasses import replace
-from abb_egm_controller.buffer import Buffer
-from trajectory_msgs.msg import JointTrajectoryPoint
-from rclpy.action.server import ServerGoalHandle
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import JointState
-from example_interfaces.srv import SetBool
+from trajectory_msgs.msg import JointTrajectoryPoint
+
+from abb_egm_controller import egm_pb2 as egm
+from abb_egm_controller.buffer import Buffer
+from abb_egm_controller.controller_state import ControllerState
+from abb_egm_controller.egm_config import PARAM_SPECS, ControllerConfig, ControlSpace
+from abb_egm_controller.msg_conversion import egm_robot_to_ros, ros_sensor_to_egm
 
 
-_ALLOWED_TRANSITIONS = [
-    # to: F      I      S      T
-    [True, True, False, False],  # from: F (FAULT)
-    [True, True, True, True],  # from: I (IDLE)
-    [True, True, True, True],  # from: S (STREAMING)
-    [True, True, True, True],  # from: T (TRAJECTORY)
-]
+@dataclass
+class TrajExecutionState:
+    points: list[JointTrajectoryPoint] = field(default_factory=list)
+    joint_indices: list[int] = field(default_factory=list)  # trajectory joint order -> robot joint index
+    start_time: float = 0.0
+    current_idx: int = 0
+    segment_idx: int = 0
+    last_setpoint: list[float] = field(default_factory=list)
+    start_positions: list[float] = field(default_factory=list)
+    done_event: Event = field(default_factory=Event)
+    cancelled: bool = False
 
-_REQUIRES_STOP = [
-    # to: F      I      S      T
-    [False, False, False, False],  # from: F (FAULT)
-    [False, False, False, False],  # from: I (IDLE)
-    [False, False, False, True],  # from: S (STREAMING)
-    [False, False, True, False],  # from: T (TRAJECTORY)
-]
-
-STREAM_QOS = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-
-
-class ControllerState(Enum):
-    FAULT = 0
-    IDLE = 1
-    STREAMING = 2
-    TRAJECTORY = 3
-
-    @classmethod
-    def from_srv(cls, value: int) -> ControllerState:
-        for state in cls:
-            if getattr(SetControlMode.Request, state.name) == value:
-                return state
-        raise ValueError(f"Invalid control state value: {value}")
-
-    def to_srv(self) -> int:
-        return getattr(SetControlMode.Request, self.name)
-
-    def validate_transition(self, requested: ControllerState, stop_active_motion: bool) -> tuple[bool, str]:
-        i = self.value
-        j = requested.value
-        if self == requested:
-            return True, f"Already in {self.name} state"
-
-        if not _ALLOWED_TRANSITIONS[i][j]:
-            return False, f"Transition from {self.name} to {requested.name} is not allowed"
-
-        if _REQUIRES_STOP[i][j] and not stop_active_motion:
-            return False, f"Transition from {self.name} to {requested.name} requires stop_active_motion=True"
-
-        return True, f"Transition from {self.name} to {requested.name} is valid"
-
+    def reset(self):
+        self.points.clear()
+        self.joint_indices.clear()
+        self.start_time = 0.0
+        self.current_idx = 0
+        self.segment_idx = 0
+        self.last_setpoint.clear()
+        self.start_positions.clear()
+        self.done_event.clear()
+        self.cancelled = False
 
 
 class EGMController(Node):
@@ -89,20 +64,16 @@ class EGMController(Node):
         self.egm_connected = False
         self.state = ControllerState.IDLE
 
+        self.stream_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST, depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT
+        )
+
         self._stream_buffer: Buffer[RobotPoseState | RobotJointState | None] = Buffer(None)
 
         # Trajectory execution state (shared between EGM loop and action execute callback)
         self._traj_lock = Lock()
-        self._traj_points = []
-        self._traj_joint_indices: list[int] = []  # trajectory joint order -> robot joint index
-        self._traj_start_time: float = 0.0
-        self._traj_current_idx: int = 0
-        self._traj_done_event = Event()
-        self._traj_cancelled: bool = False
-        self._traj_last_setpoint: list[float] = []
+        self._traj_state = TrajExecutionState()
         self._traj_final_goal_tolerance: float = 0.001  # radians
-        self._traj_segment_idx: int = 0
-        self._traj_start_positions: list[float] = []
 
         self._gripper_lock = Lock()
         self._gripper_cmd = False
@@ -130,7 +101,7 @@ class EGMController(Node):
                     spec.descriptor,
                 )
                 for name, spec in PARAM_SPECS.items()
-            ]
+            ],
         )
 
     def _init_topics(self):
@@ -141,8 +112,20 @@ class EGMController(Node):
         self.joint_state_pub = self.create_publisher(JointState, "/joint_states", 10, callback_group=self._pub_cb_group)
 
         self._sub_cb_group = ReentrantCallbackGroup()
-        self.create_subscription(RobotPoseState, f"/{self.get_name()}/control/pose_stream", self._stream_callback, STREAM_QOS, callback_group=self._sub_cb_group)
-        self.create_subscription(RobotJointState, f"/{self.get_name()}/control/joints_stream", self._stream_callback, STREAM_QOS, callback_group=self._sub_cb_group)
+        self.create_subscription(
+            RobotPoseState,
+            f"/{self.get_name()}/control/pose_stream",
+            self._stream_callback,
+            self.stream_qos,
+            callback_group=self._sub_cb_group,
+        )
+        self.create_subscription(
+            RobotJointState,
+            f"/{self.get_name()}/control/joints_stream",
+            self._stream_callback,
+            self.stream_qos,
+            callback_group=self._sub_cb_group,
+        )
 
     def _init_services(self):
         self._srv_cb_group = ReentrantCallbackGroup()
@@ -152,7 +135,12 @@ class EGMController(Node):
             self._set_control_mode_callback,
             callback_group=self._srv_cb_group,
         )
-        self.create_service(SetBool, f"/{self.get_name()}/control/set_gripper", self._set_gripper_callback, callback_group=self._srv_cb_group)
+        self.create_service(
+            SetBool,
+            f"/{self.get_name()}/control/set_gripper",
+            self._set_gripper_callback,
+            callback_group=self._srv_cb_group,
+        )
 
         self._action_cb_group = ReentrantCallbackGroup()
         self._action_server = ActionServer(
@@ -190,7 +178,6 @@ class EGMController(Node):
         addr = None
 
         self.get_logger().info(f"EGM controller started, listening for robot data on UDP port {self.config.udp_port}")
-        RELAY_ADDR = ("host.docker.internal", 6511)
 
         while rclpy.ok():
             try:
@@ -214,7 +201,19 @@ class EGMController(Node):
                 ext_joint_types=self.config.ext_joint_types,
             )
             self.feedback_pub.publish(ros_robot_msg)
-            self.joint_state_pub.publish(ros_robot_msg.feedback_joints)     # TODO: also publish ext joints
+
+            # TODO: refactor this. temporary for gripper state
+            fb_joints_with_gripper = JointState()
+            fb_joints_with_gripper.name = list(ros_robot_msg.feedback_joints.name)
+            fb_joints_with_gripper.position = list(ros_robot_msg.feedback_joints.position)
+            fb_joints_with_gripper.name.append("left_finger_joint")
+            if ros_robot_msg.rapid_dig_val:
+                fb_joints_with_gripper.position.append(0.01)  # closed
+            else:
+                fb_joints_with_gripper.position.append(0.0)  # open
+
+            # self.joint_state_pub.publish(ros_robot_msg.feedback_joints)  # TODO: also publish ext joints
+            self.joint_state_pub.publish(fb_joints_with_gripper)
             self._latest_feedback_joints = list(ros_robot_msg.feedback_joints.position)
 
             try:
@@ -223,11 +222,18 @@ class EGMController(Node):
                 self.get_logger().error(f"Error forming ROS sensor message: {e}")
                 continue
             egm_sensor_msg = ros_sensor_to_egm(ros_sensor_msg, ext_joint_types=self.config.ext_joint_types)
-            self.egm_socket.sendto(egm_sensor_msg.SerializeToString(), RELAY_ADDR)
+
+            if self.config.docker_mode:
+                addr = ("host.docker.internal", self.config.relay_port_out)
+            self.egm_socket.sendto(egm_sensor_msg.SerializeToString(), addr)
 
     def _form_ros_sensor_msg(self, ros_robot_msg: EgmRobot) -> EgmSensor:
         ros_sensor_msg = EgmSensor()
         ros_sensor_msg.msg_type = EgmSensor.MSGTYPE_CORRECTION
+
+        ros_sensor_msg.send_rapid_data = True
+        with self._gripper_lock:
+            ros_sensor_msg.rapid_dnum = [float(self._gripper_cmd)]  # 0.0 for open, 1.0 for close
 
         if self.config.control_space == ControlSpace.JOINT:
             ros_sensor_msg.mode = EgmSensor.MODE_JOINTS
@@ -273,16 +279,7 @@ class EGMController(Node):
             return ros_sensor_msg
 
         if self.state == ControllerState.TRAJECTORY:
-            with self._traj_lock:
-                points: list[JointTrajectoryPoint] = self._traj_points
-                joint_indices = self._traj_joint_indices
-                start_time = self._traj_start_time
-                seg_idx = self._traj_segment_idx
-                traj_cancelled = self._traj_cancelled
-                start_positions = self._traj_start_positions
-                final_tol = self._traj_final_goal_tolerance
-
-            if not points or traj_cancelled:
+            if not self._traj_state.points or self._traj_state.cancelled:
                 ros_sensor_msg.planned_joints = ros_robot_msg.feedback_joints
                 ros_sensor_msg.planned_ext_joints = ros_robot_msg.feedback_ext_joints
                 return ros_sensor_msg
@@ -290,31 +287,42 @@ class EGMController(Node):
             actual = ros_robot_msg.feedback_joints.position
             setpoint = list(actual)
 
-            elapsed = time.monotonic() - start_time
-            final_time = points[-1].time_from_start.sec + 1e-9 * points[-1].time_from_start.nanosec
+            elapsed = time.monotonic() - self._traj_state.start_time
+            final_time = (
+                self._traj_state.points[-1].time_from_start.sec
+                + 1e-9 * self._traj_state.points[-1].time_from_start.nanosec
+            )
 
             # Advance cached segment index only forward
-            last_seg = len(points) - 1
-            while seg_idx < last_seg and (
-                points[seg_idx].time_from_start.sec + 1e-9 * points[seg_idx].time_from_start.nanosec
-            ) < elapsed:
-                seg_idx += 1
+            last_seg = len(self._traj_state.points) - 1
+            while (
+                self._traj_state.segment_idx < last_seg
+                and (
+                    self._traj_state.points[self._traj_state.segment_idx].time_from_start.sec
+                    + 1e-9 * self._traj_state.points[self._traj_state.segment_idx].time_from_start.nanosec
+                )
+                < elapsed
+            ):
+                self._traj_state.segment_idx += 1
 
             # Determine interpolation endpoints
-            if seg_idx == 0:
+            if self._traj_state.segment_idx == 0:
                 t0 = 0.0
-                p0 = start_positions
-                p1 = points[0].positions
-                t1 = points[0].time_from_start.sec + 1e-9 * points[0].time_from_start.nanosec
+                p0 = self._traj_state.start_positions
+                p1 = self._traj_state.points[0].positions
+                t1 = (
+                    self._traj_state.points[0].time_from_start.sec
+                    + 1e-9 * self._traj_state.points[0].time_from_start.nanosec
+                )
                 current_idx = 0
             else:
-                prev_pt = points[seg_idx - 1]
-                next_pt = points[seg_idx]
+                prev_pt = self._traj_state.points[self._traj_state.segment_idx - 1]
+                next_pt = self._traj_state.points[self._traj_state.segment_idx]
                 t0 = prev_pt.time_from_start.sec + 1e-9 * prev_pt.time_from_start.nanosec
                 t1 = next_pt.time_from_start.sec + 1e-9 * next_pt.time_from_start.nanosec
                 p0 = prev_pt.positions
                 p1 = next_pt.positions
-                current_idx = seg_idx
+                current_idx = self._traj_state.segment_idx
 
             # Interpolate according to elapsed time
             if elapsed >= final_time:
@@ -326,10 +334,10 @@ class EGMController(Node):
                 alpha = max(0.0, min(1.0, alpha))
 
             sq_final_err = 0.0
-            final_positions = points[-1].positions
+            final_positions = self._traj_state.points[-1].positions
 
-            for i, traj_i in enumerate(joint_indices):
-                q0 = p0[traj_i] if seg_idx == 0 else p0[i]
+            for i, traj_i in enumerate(self._traj_state.joint_indices):
+                q0 = p0[traj_i] if self._traj_state.segment_idx == 0 else p0[i]
                 q1 = p1[i]
                 desired_i = q0 + alpha * (q1 - q0)
                 setpoint[traj_i] = desired_i
@@ -340,11 +348,11 @@ class EGMController(Node):
             final_err_norm = math.sqrt(sq_final_err)
 
             with self._traj_lock:
-                self._traj_segment_idx = seg_idx
-                self._traj_current_idx = current_idx
-                self._traj_last_setpoint = setpoint
-                if elapsed >= final_time and final_err_norm <= final_tol:
-                    self._traj_done_event.set()
+                self._traj_state.segment_idx = self._traj_state.segment_idx
+                self._traj_state.current_idx = current_idx
+                self._traj_state.last_setpoint = setpoint
+                if elapsed >= final_time and final_err_norm <= self._traj_final_goal_tolerance:
+                    self._traj_state.done_event.set()
 
             ros_sensor_msg.planned_joints.header = ros_robot_msg.feedback_joints.header
             ros_sensor_msg.planned_joints.position = setpoint
@@ -356,8 +364,8 @@ class EGMController(Node):
 
     def _cancel_trajectory_motion(self):
         with self._traj_lock:
-            self._traj_cancelled = True
-        self._traj_done_event.set()
+            self._traj_state.cancelled = True
+        self._traj_state.done_event.set()
 
     def _enter_fault_state(self):
         pass
@@ -369,7 +377,9 @@ class EGMController(Node):
     def _trajectory_goal_callback(self, goal_request: ExecuteTrajectory.Goal) -> GoalResponse:
         trajectory = goal_request.trajectory
         stop_active_motion = goal_request.stop_active_motion
-        self.get_logger().info(f"Received trajectory goal request: {len(trajectory.points)} points, stop_active_motion={stop_active_motion}")
+        self.get_logger().info(
+            f"Received trajectory goal request: {len(trajectory.points)} points, stop_active_motion={stop_active_motion}"
+        )
         if not trajectory.points:
             self.get_logger().warn("Rejecting trajectory goal: trajectory is empty")
             return GoalResponse.REJECT
@@ -407,7 +417,7 @@ class EGMController(Node):
             self._stop_streaming_motion()
         if self.state == ControllerState.TRAJECTORY and stop_active:
             self._cancel_trajectory_motion()
-            self._traj_done_event.wait()
+            self._traj_state.done_event.wait()
 
         robot_joint_names = self.config.robot_joint_names
         joint_indices = [robot_joint_names.index(name) for name in trajectory.joint_names]
@@ -418,15 +428,19 @@ class EGMController(Node):
             initial_feedback = [0.0] * len(robot_joint_names)
 
         with self._traj_lock:
-            self._traj_points = list(trajectory.points)
-            self._traj_joint_indices = joint_indices
-            self._traj_start_time = start_time
-            self._traj_current_idx = 0
-            self._traj_segment_idx = 0
-            self._traj_done_event.clear()
-            self._traj_cancelled = False
-            self._traj_last_setpoint = initial_feedback.copy()
-            self._traj_start_positions = initial_feedback.copy()
+            self._traj_state.reset()  # TODO: instead of making this a state tracker, refactor into a trajectory executable, and each call instantiates a new instance
+            self._traj_state.points = list(trajectory.points)
+            self._traj_state.joint_indices = joint_indices
+            self._traj_state.start_time = start_time
+        
+        # temp debugging
+        # print all _traj_state fields
+        with self._traj_lock:
+            print("Trajectory State Fields:")
+            for attr_name in dir(self._traj_state):
+                if not attr_name.startswith('_'):
+                    print(f"  {attr_name}: {getattr(self._traj_state, attr_name)}")
+
 
         self.state = ControllerState.TRAJECTORY
         self.get_logger().info(f"Executing time-parameterized trajectory with {len(trajectory.points)} points")
@@ -443,7 +457,7 @@ class EGMController(Node):
                 result.error_code = 2
                 return result
 
-            if self._traj_done_event.is_set():
+            if self._traj_state.done_event.is_set():
                 self.get_logger().info("Trajectory execution completed successfully")
                 self.state = ControllerState.IDLE
                 goal_handle.succeed()
@@ -454,8 +468,8 @@ class EGMController(Node):
 
             elapsed = time.monotonic() - start_time
             with self._traj_lock:
-                current_idx = self._traj_current_idx
-                desired_all = self._traj_last_setpoint
+                current_idx = self._traj_state.current_idx
+                desired_all = self._traj_state.last_setpoint
 
             feedback.elapsed_time = Duration(
                 sec=int(elapsed),
@@ -571,6 +585,7 @@ def main():
     executor.add_node(node)
     executor.spin()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

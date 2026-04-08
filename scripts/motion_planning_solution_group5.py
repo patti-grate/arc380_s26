@@ -453,7 +453,6 @@ strcuture_quaternions = np.array([
 [5.6025e-12, 0.0000e+00 ,1.0000e+00 ,0.0000e+00],
 [ 0.    ,     -0.41036472 , 0.91192148 , 0.        ],
 [ 0.64482587, -0.29017168,  0.64482587 , 0.29017168],
-[ 0.64482587, -0.29017168 , 0.64482587 , 0.29017168],
 [0.     ,    0.91192148, 0.41036472 ,0.        ]
 ])
 structure_positions = np.array([[0.350319, -0.262939, 0.0305],
@@ -555,7 +554,7 @@ def brick_grab_pos(step: int):
         return None
     # given brick values 0-19:
     X = step % 4 # 4 rows
-    Y = step // 5 # 5 columns
+    Y = step // 4 # 5 columns
     next_brick_X = X * brick_deltaX + brick_og[0]
     next_brick_Y = Y * brick_deltaY + brick_og[1]
     next_brick_Z = brick_og[2]  # Z positions are same

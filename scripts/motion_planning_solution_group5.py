@@ -435,7 +435,7 @@ class PlanAndExecuteClient(Node):
     
 # Function
 
-brick_og = [0.000, 0.420, 0.032]
+brick_og = [0.000, 0.480, 0.032]
 brick_offsetX = -0.02 # how far from the center to do it
 # it is supposed to be 1 cm from the left edge 
 brick_deltaX = 0.06

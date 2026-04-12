@@ -8,6 +8,7 @@ x-ros2-common: &ros2-common
   volumes:
     - ../workshops:/workshops
     - ../scripts:/scripts
+    - ../realsense_shared:/realsense_shared
 
   environment:
     - DISPLAY=:1

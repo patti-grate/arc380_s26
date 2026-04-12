@@ -31,7 +31,7 @@ RUN curl -sSL https://packages.osrfoundation.org/gazebo.gpg | \
         http://packages.osrfoundation.org/gazebo/ubuntu-stable noble main" \
         > /etc/apt/sources.list.d/gazebo-stable.list
 
-# ── ROS 2 + simulation packages ───────────────────────────────────────────────
+# ── ROS 2 + simulation + RealSense packages ───────────────────────────────────
 RUN apt-get update && apt-get install -y \
     ros-jazzy-desktop-full \
     ros-jazzy-gz-ros2-control \

@@ -337,7 +337,7 @@ def main():
         frame_id="world",
         goal_xyz=(0.0, 0.480, 0.1),
         goal_quat_wxyz=(0.0, 1.0, 0.0, 0.0),
-            
+        max_velocity_scaling=0.5,            
     )
     if arm_traj is not None:
         node.execute_moveit_trajectory(arm_traj)

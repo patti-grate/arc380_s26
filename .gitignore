@@ -10,6 +10,9 @@ log/
 # Workshops
 src/arc380*
 
+# Perception outputs
+realsense_shared/*
+
 # python
 __pycache__/
 *.pyc

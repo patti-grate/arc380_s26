@@ -51,7 +51,9 @@ def get_next_request_id() -> int:
     return 1
 
 
-def request_capture(timeout_sec: float = TIMEOUT_SEC) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+def request_capture(
+    timeout_sec: float = TIMEOUT_SEC,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     SHARED_DIR.mkdir(parents=True, exist_ok=True)
 
     request_id = get_next_request_id()
@@ -101,7 +103,9 @@ def request_capture(timeout_sec: float = TIMEOUT_SEC) -> tuple[np.ndarray, np.nd
 
         time.sleep(POLL_INTERVAL_SEC)
 
-    raise TimeoutError(f"Timed out waiting for capture response after {timeout_sec} seconds")
+    raise TimeoutError(
+        f"Timed out waiting for capture response after {timeout_sec} seconds"
+    )
 
 
 def main() -> int:

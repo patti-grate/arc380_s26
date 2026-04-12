@@ -1,6 +1,6 @@
 # as-built mesh construction from depth image and brick pose detection by comparing meshes/depth images.
 
-# function that takes two images and retrieve precise brick pose, and checks reachability.
+# function that takes two depth images and retrieve precise brick pose.
 
 # from depth point cloud images --> line up both frames and find the point cloud of the new block
 # then fit the block to the point cloud (icp) --> say that one side will always be flat

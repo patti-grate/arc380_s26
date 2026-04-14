@@ -185,6 +185,8 @@ class PlanAndExecuteClient(Node):
         self,
         group_name: str,
         link_name: str,
+        goal_joint_names: list[str],
+        goal_joint_positions: list[float],
         frame_id: str,
         goal_xyz: tuple[float, float, float],
         start_joint_names: list[str] | None = None,
@@ -224,6 +226,16 @@ class PlanAndExecuteClient(Node):
                 target_quat_wxyz=goal_quat_wxyz,
                 tolerance_rpy=ori_tolerance_rpy,
             )
+        ]
+        constraints = Constraints()
+        constraints.joint_constraints = [
+            self._make_joint_constraint(
+                joint_name=n,
+                position=p,
+                tolerance_above=0.1,
+                tolerance_below=0.1,
+            )
+            for n, p in zip(goal_joint_names, goal_joint_positions)
         ]
         mpr.goal_constraints = [constraints]
 
@@ -457,8 +469,8 @@ strcuture_quaternions = np.array([
 ])
 structure_positions = np.array([[0.350319, -0.262939, 0.0305],
                                 [0.355875, -0.262939, 0.075744],
-                                [0.319363, -0.262939, 0.075744],
                                 [0.350319, -0.262939, 0.095588],
+                                [0.319363, -0.262939, 0.075744],
                                 [0.346041, -0.253434, 0.109875],
                                 [0.349726, -0.250732, 0.155119],
                                 [0.325511, -0.278059, 0.155119],

@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 
+
 SHARED_DIR = Path("/realsense_shared")
 REQUEST_PATH = SHARED_DIR / "request.json"
 READY_PATH = SHARED_DIR / "ready.json"

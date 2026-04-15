@@ -185,8 +185,6 @@ class PlanAndExecuteClient(Node):
         self,
         group_name: str,
         link_name: str,
-        goal_joint_names: list[str],
-        goal_joint_positions: list[float],
         frame_id: str,
         goal_xyz: tuple[float, float, float],
         start_joint_names: list[str] | None = None,
@@ -226,16 +224,6 @@ class PlanAndExecuteClient(Node):
                 target_quat_wxyz=goal_quat_wxyz,
                 tolerance_rpy=ori_tolerance_rpy,
             )
-        ]
-        constraints = Constraints()
-        constraints.joint_constraints = [
-            self._make_joint_constraint(
-                joint_name=n,
-                position=p,
-                tolerance_above=0.1,
-                tolerance_below=0.1,
-            )
-            for n, p in zip(goal_joint_names, goal_joint_positions)
         ]
         mpr.goal_constraints = [constraints]
 
@@ -447,7 +435,7 @@ class PlanAndExecuteClient(Node):
     
 # Function
 
-brick_og = [0.000, 0.480, 0.032]
+brick_og = [0.000, 0.420, 0.032]
 brick_offsetX = -0.02 # how far from the center to do it
 # it is supposed to be 1 cm from the left edge 
 brick_deltaX = 0.06
@@ -459,18 +447,19 @@ strcuture_quaternions = [] # array continaing the brick quats within the struct
 pause_offsetZ = 0.1 # how much to offset before moving down with gripper 
 strcuture_quaternions = np.array([
 [-8.09525e-12 , 0.00000e+00 , 1.00000e+00 , 0.00000e+00],
-[0.70710678 , 0.    ,     0.70710678, 0.               ],
-[0.70710678 ,0.   ,      0.70710678, 0.                ],
+[0.70710678 , 0.    ,     0.70710678, 0.        ],
 [-8.09525e-12 , 0.00000e+00 , 1.00000e+00 , 0.00000e+00],
-[5.6025e-12, 0.0000e+00 ,1.0000e+00 ,        0.0000e+00],
-[ 0.    ,     -0.41036472 , 0.91192148 , 0.            ],
-[ 0.64482587, -0.29017168,  0.64482587 ,     0.29017168],
-[0.     ,    0.91192148, 0.41036472 ,0.                ]
+[0.70710678 ,0.   ,      0.70710678, 0.        ],
+[5.6025e-12, 0.0000e+00 ,1.0000e+00 ,0.0000e+00],
+[ 0.    ,     -0.41036472 , 0.91192148 , 0.        ],
+[ 0.64482587, -0.29017168,  0.64482587 , 0.29017168],
+[ 0.64482587, -0.29017168 , 0.64482587 , 0.29017168],
+[0.     ,    0.91192148, 0.41036472 ,0.        ]
 ])
 structure_positions = np.array([[0.350319, -0.262939, 0.0305],
                                 [0.355875, -0.262939, 0.075744],
-                                [0.350319, -0.262939, 0.095588],
                                 [0.319363, -0.262939, 0.075744],
+                                [0.350319, -0.262939, 0.095588],
                                 [0.346041, -0.253434, 0.109875],
                                 [0.349726, -0.250732, 0.155119],
                                 [0.325511, -0.278059, 0.155119],
@@ -566,7 +555,7 @@ def brick_grab_pos(step: int):
         return None
     # given brick values 0-19:
     X = step % 4 # 4 rows
-    Y = step // 4 # 5 columns
+    Y = step // 5 # 5 columns
     next_brick_X = X * brick_deltaX + brick_og[0]
     next_brick_Y = Y * brick_deltaY + brick_og[1]
     next_brick_Z = brick_og[2]  # Z positions are same

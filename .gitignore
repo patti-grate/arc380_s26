@@ -20,3 +20,4 @@ __pycache__/
 # rhino
 *.3dmbak
 *.rhl
+test_*

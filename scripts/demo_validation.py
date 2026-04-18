@@ -145,6 +145,7 @@ if HAVE_ROS2:
                 cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
                 subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
+            self.clear_collapse_message()
             self.current_model_states.clear()
             time.sleep(1)
             return True
@@ -167,6 +168,18 @@ if HAVE_ROS2:
                 self.get_logger().warn(f"Failed to natively spawn {name}")
                 return False
 
+        def display_collapse_message(self, text="COLLAPSE DETECTED!"):
+            import subprocess
+            msg = f"ns: 'val', id: 100, action: ADD_MODIFY, type: TEXT, text: '{text}', pose: {{position: {{x: 0.15, y: 0.35, z: 0.5}}}}, scale: {{x: 0.08, y: 0.08, z: 0.08}}, material: {{ambient: {{r: 1.0, g: 0.0, b: 0.0, a: 1.0}}}}"
+            cmd = f'gz topic -t /marker -m gz.msgs.Marker -p "{msg}"'
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def clear_collapse_message(self):
+            import subprocess
+            msg = f"ns: 'val', id: 100, action: DELETE_MARKER"
+            cmd = f'gz topic -t /marker -m gz.msgs.Marker -p "{msg}"'
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         def check_stability(self, initial_states):
             self.fetch_latest_poses_from_gz()
             
@@ -184,6 +197,7 @@ if HAVE_ROS2:
                     self.get_logger().warn(
                         f"{name} collapse detected! (dZ: {dz:.3f}m)"
                     )
+                    self.display_collapse_message()
                     return False
             return True
 

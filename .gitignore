@@ -16,3 +16,7 @@ realsense_shared/*
 # python
 __pycache__/
 *.pyc
+
+# rhino
+*.3dmbak
+*.rhl

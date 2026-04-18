@@ -6,9 +6,10 @@ x-ros2-common: &ros2-common
   network_mode: host
 
   volumes:
-    - ../workshops:/workshops
-    - ../scripts:/scripts
-    - ../realsense_shared:/realsense_shared
+    - ../workshops:/ros2_ws/workshops
+    - ../scripts:/ros2_ws/scripts
+    - ../realsense_shared:/ros2_ws/realsense_shared
+    - ../training_data:/ros2_ws/training_data
 
   environment:
     - DISPLAY=:1

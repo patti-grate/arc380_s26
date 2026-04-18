@@ -10,23 +10,24 @@ if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
-# ── 1. Virtual display ────────────────────────────────────────────────────────
+#  1. Virtual display 
 echo "[1/5] Starting virtual display (Xvfb)..."
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 Xvfb :1 -screen 0 1920x1080x24 -ac +extension GLX &
 sleep 2
 export DISPLAY=:1
 
-# ── 2. Window manager ─────────────────────────────────────────────────────────
+#  2. Window manager 
 echo "[2/5] Starting window manager (openbox)..."
 openbox &
 sleep 1
 
-# ── 3. VNC server ─────────────────────────────────────────────────────────────
+#  3. VNC server 
 echo "[3/5] Starting VNC server (x11vnc)..."
 x11vnc -display :1 -nopw -forever -shared -bg -quiet
 sleep 1
 
-# ── 4. noVNC web interface ────────────────────────────────────────────────────
+#  4. noVNC web interface 
 echo "[4/5] Starting noVNC web interface on port 6080..."
 websockify --web /usr/share/novnc/ --daemon 6080 localhost:5900
 
@@ -37,7 +38,7 @@ echo "  VNC direct:        localhost:5900  (no password)"
 echo "========================================================================"
 echo ""
 
-# ── 5. Launch simulation ──────────────────────────────────────────────────────
+#  5. Launch simulation 
 echo "[5/5] Launching MoveIt + Gazebo simulation..."
 ros2 launch abb_irb120_gazebo gz_moveit.launch.py &
 SIM_PID=$!

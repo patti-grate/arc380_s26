@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-ros2-control \
     ros-jazzy-ros2-controllers \
     ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-ros-gz \
     python3-colcon-common-extensions \
     python3-rosdep \
     python3-pip \
@@ -61,7 +62,7 @@ RUN apt-get update && apt-get install -y \
 # ── rosdep init ───────────────────────────────────────────────────────────────
 RUN rosdep init && rosdep update
 
-RUN python3 -m pip install --no-cache-dir --break-system-packages "protobuf==6.31.1"
+RUN python3 -m pip install --no-cache-dir --break-system-packages "protobuf==6.31.1" "rhino3dm" "scipy"
 
 
 FROM base AS workspace

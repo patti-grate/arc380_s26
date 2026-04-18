@@ -23,9 +23,16 @@ def generate_launch_description():
         .to_moveit_configs()
     )
 
-    world = os.path.join(
-        get_package_share_directory("abb_irb120_gazebo"), "worlds", "workcell.sdf"
+    from launch.actions import DeclareLaunchArgument
+    from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+
+    world_arg = DeclareLaunchArgument(
+        'world_file', default_value='workcell.sdf', description='Simulation world file to load'
     )
+    
+    world = PathJoinSubstitution([
+        get_package_share_directory("abb_irb120_gazebo"), "worlds", LaunchConfiguration('world_file')
+    ])
 
     rviz_config_file = os.path.join(pkg_moveit, "config", "moveit.rviz")
 
@@ -135,6 +142,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        world_arg,
         gazebo,
         clock_bridge,
         rsp,

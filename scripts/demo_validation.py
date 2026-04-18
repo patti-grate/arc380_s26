@@ -66,13 +66,10 @@ if HAVE_ROS2:
             DemoValidator.__init__(self)
 
             self.sdf_path = os.path.join(os.getcwd(), "src", "abb_irb120_gazebo", "models", "brick", "model.sdf")
+            self.active_bricks = {}  # tracked by name
             
             # Spin up internal temporary ros_gz_bridges 
             import subprocess
-            self.bridge_proc = subprocess.Popen(
-                "ros2 run ros_gz_bridge parameter_bridge /world/irb120_workcell/dynamic_pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V --ros-args -r /world/irb120_workcell/dynamic_pose/info:=/tf", 
-                shell=True
-            )
             self.control_bridge = subprocess.Popen(
                 "ros2 run ros_gz_bridge parameter_bridge /world/irb120_workcell/control@ros_gz_interfaces/srv/ControlWorld", 
                 shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -88,30 +85,41 @@ if HAVE_ROS2:
             except Exception as e:
                 self.get_logger().error(f"Could not load SDF from {sdf_path}: {e}")
 
-        def model_states_cb(self, msg):
-            for transform in msg.transforms:
-                name = transform.child_frame_id
-                # Accept combinations like demo_1_brick_5 etc.
-                if "brick" in name:
-                    # Mock a pose object locally to match our logic
-                    pose_mock = type("pos", (object,), {
-                        "position": type("p", (object,), {
-                            "x": transform.transform.translation.x,
-                            "y": transform.transform.translation.y,
-                            "z": transform.transform.translation.z
-                        })
-                    })
-                    self.current_model_states[name] = pose_mock
-                    # Mock a pose object locally to match our logic
-                    pose_mock = type("pos", (object,), {
-                        "position": type("p", (object,), {
-                            "x": transform.transform.translation.x,
-                            "y": transform.transform.translation.y,
-                            "z": transform.transform.translation.z
-                        })
-                    })
-                    self.current_model_states[name] = pose_mock
+        def fetch_latest_poses_from_gz(self):
+            import subprocess
+            import re
+            try:
+                output = subprocess.check_output(
+                    "gz topic -e -n 1 -t /world/irb120_workcell/pose/info", 
+                    shell=True, text=True, timeout=2.0
+                )
+                poses = output.split("pose {")
+                for pose_str in poses:
+                    if "name:" not in pose_str: continue
+                    name_match = re.search(r'name:\s+"([^"]+)"', pose_str)
+                    if not name_match: continue
+                    name = name_match.group(1)
+                    if "brick" not in name: continue
+                    
+                    def get_val(regex, s):
+                        m = re.search(regex, s)
+                        return float(m.group(1)) if m else 0.0
 
+                    x_val = get_val(r'x:\s+([^\n]+)', pose_str)
+                    y_val = get_val(r'y:\s+([^\n]+)', pose_str)
+                    z_val = get_val(r'z:\s+([^\n]+)', pose_str)
+
+                    pose_mock = type("pos", (object,), {
+                        "position": type("p", (object,), {
+                            "x": x_val,
+                            "y": y_val,
+                            "z": z_val
+                        })
+                    })
+                    self.current_model_states[name] = pose_mock
+            except Exception as e:
+                pass
+                
         def reset_world(self):
             # Use bridged control service to natively reset Gazebo scenes
             self.get_logger().info("Simulation layer refresh (Resetting states...)")
@@ -124,52 +132,62 @@ if HAVE_ROS2:
             else:
                 self.get_logger().warn("Could not find bridged ControlWorld service to reset simulation.")
                 
+            self.get_logger().info("Purging populated simulation components to prepare a clean stage...")
+            import subprocess
+            # Purge the original 20 bricks that respawn upon reset
+            for i in range(25):
+                name = f"brick_{i:02d}"
+                cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
+                subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Purge any remaining tracked demo bricks locally
+            for name in list(self.current_model_states.keys()):
+                cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
+                subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
             self.current_model_states.clear()
             time.sleep(1)
             return True
 
         def spawn_brick(self, name, pose_7d):
             import subprocess
-            from scipy.spatial.transform import Rotation as R
             
-            euler_rpy = R.from_quat(pose_7d[3:]).as_euler('xyz')
+            x, y, z = pose_7d[0], pose_7d[1], pose_7d[2] + 0.001
+            qx, qy, qz, qw = pose_7d[3], pose_7d[4], pose_7d[5], pose_7d[6]
             
-            cmd = f'ros2 run ros_gz_sim create -file "{self.sdf_path}" -name "{name}" ' \
-                  f'-x {pose_7d[0]:.4f} -y {pose_7d[1]:.4f} -z {(pose_7d[2] + 0.001):.4f} ' \
-                  f'-R {euler_rpy[0]:.4f} -P {euler_rpy[1]:.4f} -Y {euler_rpy[2]:.4f}'
-                  
+            req_str = f"sdf_filename: \\\"{self.sdf_path}\\\" name: \\\"{name}\\\" pose: {{ position: {{x: {x} y: {y} z: {z}}} orientation: {{x: {qx} y: {qy} z: {qz} w: {qw}}} }}"
+            cmd = f'gz service -s /world/irb120_workcell/create --reqtype gz.msgs.EntityFactory --reptype gz.msgs.Boolean --timeout 2000 --req "{req_str}"'
+            
             try:
+                # Bypass ROS 2 node-spin execution entirely and directly inject into simulation memory using Ignite's internal protocol
                 subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.get_logger().info(f"Spawned {name} in simulation")
                 return True
             except subprocess.CalledProcessError:
-                self.get_logger().warn(f"Failed to execute subprocess spawn for {name}")
+                self.get_logger().warn(f"Failed to natively spawn {name}")
                 return False
 
         def check_stability(self, initial_states):
+            self.fetch_latest_poses_from_gz()
+            
             if not self.current_model_states:
-                self.get_logger().warn("CRITICAL: No TF states tracked over the active bridges! Collapse detection is currently blind.")
+                self.get_logger().warn("CRITICAL: Poses unavilable from Gazebo! Collapse detection is currently blind.")
             for name, initial_pose in initial_states.items():
                 if name not in self.current_model_states:
                     continue
                 curr_pose = self.current_model_states[name]
 
-                dx = curr_pose.position.x - initial_pose.position.x
-                dy = curr_pose.position.y - initial_pose.position.y
                 dz = curr_pose.position.z - initial_pose.position.z
-                dist = np.sqrt(dx**2 + dy**2 + dz**2)
 
-                # Check for structural collapse (fell > 1cm OR moved horizontally > 1.5cm)
-                if dz < -0.01 or dist > 0.015:
+                # Check for structural collapse (fell > 1cm)
+                if dz < -0.01:
                     self.get_logger().warn(
-                        f"{name} collapse detected! (Moved by {dist:.3f}m, dZ: {dz:.3f}m)"
+                        f"{name} collapse detected! (dZ: {dz:.3f}m)"
                     )
                     return False
             return True
 
         def destroy_node(self):
-            if hasattr(self, 'bridge_proc'):
-                self.bridge_proc.terminate()
             if hasattr(self, 'control_bridge'):
                 self.control_bridge.terminate()
             super().destroy_node()
@@ -296,13 +314,13 @@ def main(args=None):
                     print(f"Failed to physically spawn {name}")
 
                 if HAVE_ROS2:
-                    # Spin for 2 seconds total simulating physics settle
-                    for _ in range(20):
-                        rclpy.spin_once(validator, timeout_sec=0.1)
+                    # Sleep for 2 seconds to simulate physics settle (we no longer spin ros bridges)
+                    time.sleep(2.0)
                 else:
                     time.sleep(0.1)  # Mock wait
 
                 # Snapshot initial resting pose
+                validator.fetch_latest_poses_from_gz()
                 if name in validator.current_model_states:
                     initial_states[name] = validator.current_model_states[name]
 

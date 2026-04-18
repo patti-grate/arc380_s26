@@ -40,7 +40,8 @@ echo ""
 
 #  5. Launch simulation 
 echo "[5/5] Launching MoveIt + Gazebo simulation..."
-ros2 launch abb_irb120_gazebo gz_moveit.launch.py &
+WORLD_FILE="${SIM_WORLD_FILE:-workcell.sdf}"
+ros2 launch abb_irb120_gazebo gz_moveit.launch.py world_file:=$WORLD_FILE &
 SIM_PID=$!
 
 # Wait for the Gazebo server to be ready before connecting the GUI

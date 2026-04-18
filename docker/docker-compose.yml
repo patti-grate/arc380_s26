@@ -3,7 +3,6 @@ x-ros2-common: &ros2-common
     context: .
     dockerfile: Dockerfile
   image: arc380_ros2:latest
-  network_mode: host
 
   volumes:
     - ../workshops:/ros2_ws/workshops
@@ -28,9 +27,14 @@ services:
   ros2_sim:
     <<: *ros2-common
     container_name: arc380_ros2
+    ports:
+      - "6080:6080"
+    environment:
+      - SIM_WORLD_FILE=validation_workcell.sdf
     # no command override, so entrypoint.sh runs simulation by default
 
   ros2_real:
     <<: *ros2-common
     container_name: arc380_ros2_real
+    network_mode: host
     command: ros2 launch abb_egm_controller egm_controller.launch.py

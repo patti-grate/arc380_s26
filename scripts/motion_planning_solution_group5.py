@@ -185,8 +185,6 @@ class PlanAndExecuteClient(Node):
         self,
         group_name: str,
         link_name: str,
-        goal_joint_names: list[str],
-        goal_joint_positions: list[float],
         frame_id: str,
         goal_xyz: tuple[float, float, float],
         start_joint_names: list[str] | None = None,
@@ -237,7 +235,9 @@ class PlanAndExecuteClient(Node):
             )
             for n, p in zip(goal_joint_names, goal_joint_positions)
         ]
-        mpr.goal_constraints = [constraints]
+        
+        mpr.path_constraints = [path_constraints]
+        mpr.goal_constraints = [goal_constraints]
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)

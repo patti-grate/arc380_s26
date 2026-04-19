@@ -31,7 +31,7 @@ RUN curl -sSL https://packages.osrfoundation.org/gazebo.gpg | \
         http://packages.osrfoundation.org/gazebo/ubuntu-stable noble main" \
         > /etc/apt/sources.list.d/gazebo-stable.list
 
-# ── ROS 2 + simulation + RealSense packages ───────────────────────────────────
+# ── ROS 2 + simulation ---------------------───────────────────────────────────
 RUN apt-get update && apt-get install -y \
     ros-jazzy-desktop-full \
     ros-jazzy-gz-ros2-control \
@@ -63,6 +63,9 @@ RUN apt-get update && apt-get install -y \
 RUN rosdep init && rosdep update
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages "protobuf==6.31.1" "rhino3dm" "scipy"
+RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed \
+    "protobuf==6.31.1" \
+    "opencv-contrib-python-headless"
 
 
 FROM base AS workspace

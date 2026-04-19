@@ -208,8 +208,8 @@ class PlanAndExecuteClient(Node):
                 start_joint_names, start_joint_positions
             )
 
-        constraints = Constraints()
-        constraints.position_constraints = [
+        goal_constraints = Constraints()
+        goal_constraints.position_constraints = [
             self._make_position_constraint(
                 link_name=link_name,
                 frame_id=frame_id,
@@ -217,7 +217,7 @@ class PlanAndExecuteClient(Node):
                 tolerance_xyz=pos_tolerance_xyz,
             )
         ]
-        constraints.orientation_constraints = [
+        goal_constraints.orientation_constraints = [
             self._make_orientation_constraint(
                 link_name=link_name,
                 frame_id=frame_id,
@@ -225,17 +225,18 @@ class PlanAndExecuteClient(Node):
                 tolerance_rpy=ori_tolerance_rpy,
             )
         ]
-        constraints = Constraints()
-        constraints.joint_constraints = [
+        # Joint limits as path constraints
+        path_constraints = Constraints()
+        path_constraints.joint_constraints = [
             self._make_joint_constraint(
                 joint_name=n,
-                position=p,
-                tolerance_above=0.1,
-                tolerance_below=0.1,
+                position=center,           # midpoint of upper/lower bound
+                tolerance_above=upper - center,
+                tolerance_below=center - lower,
             )
-            for n, p in zip(goal_joint_names, goal_joint_positions)
+        for n, (lower, upper) in zip(joint_names, joint_bounds)
         ]
-        
+
         mpr.path_constraints = [path_constraints]
         mpr.goal_constraints = [goal_constraints]
 

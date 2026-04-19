@@ -131,12 +131,16 @@ class Brick:
         x, y, z, state, yaw = pose_5d
 
         if state == 0:
-            # Laying: local Z is along world Z. local X is rotated by yaw.
+            # Laying: local Z is along world Z. Local X is rotated by yaw.
             rot = R.from_euler("z", yaw)
         else:
-            # Standing: We default to Y being vertical (standing on long edge).
-            # Local Y corresponds to world Z. Local X is rotated by yaw in world XY.
-            base_mat = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+            # Standing: local X (longest axis, 51mm) is vertical (world Z).
+            # At yaw=0, local Y aligns with world X.
+            # Columns = [local_X_in_world, local_Y_in_world, local_Z_in_world]
+            #          = [world_Z,          world_X,          world_Y        ]
+            base_mat = np.array([[0, 1, 0],
+                                 [0, 0, 1],
+                                 [1, 0, 0]])
             rot = R.from_euler("z", yaw) * R.from_matrix(base_mat)
 
         quat = rot.as_quat()

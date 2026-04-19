@@ -9,6 +9,9 @@ x-ros2-common: &ros2-common
     - ../scripts:/ros2_ws/scripts
     - ../realsense_shared:/ros2_ws/realsense_shared
     - ../training_data:/ros2_ws/training_data
+    - ../workshops:/workshops
+    - ../scripts:/scripts
+    - ../src:/ros2_ws/src
 
   environment:
     - DISPLAY=:1

@@ -73,10 +73,10 @@ GRIPPER_CLOSED = 0.01
 # Grasp optimizer constants
 ROBOT_BASE_XYZ    = np.array([0.0, 0.0, 0.0])
 APPROACH_TILT_DEG = 45.0
-GRASP_STANDOFF_M  = 0.04
+GRASP_STANDOFF_X_M = 0.02   # lateral offset for tilted approaches (tune to avoid neighbours)
 
-# Joint 6 path constraint — prevents >360 degree spin
-JOINT_6_HALF_WIDTH_RAD = 4.0
+# Joint 6 path constraint — prevents multi-revolution spin
+JOINT_6_HALF_WIDTH_RAD = 2.0
 
 JOINT_NAMES = ["joint_1","joint_2","joint_3","joint_4","joint_5","joint_6"]
 JOINT_UPPER = [2.87979,  1.91986,  1.22173,  2.79253,  2.09440,  6.98132]
@@ -284,9 +284,9 @@ def generate_grasp_candidates(
             # TCP offset from brick centre
             tilt_rad     = np.radians(tilt_deg)
             offset_local = np.array([
-                -np.sin(tilt_rad) * GRASP_STANDOFF_M,  # X: toward approach side
-                 0.0,                                    # Y: centred on short axis
-                 np.cos(tilt_rad) * GRASP_STANDOFF_M,  # Z: above brick
+                -np.sin(tilt_rad) * GRASP_STANDOFF_X_M,
+                 0.0,
+                 0.0,
             ])
             grasp_pos = brick_pos + brick_rot @ offset_local
 
@@ -356,6 +356,25 @@ class PlanAndExecuteClient(Node):
         self.gripper_cmd_ac    = ActionClient(self, ParallelGripperCommand,
                                               "/gripper_controller/gripper_cmd")
         self._collision_pub    = self.create_publisher(CollisionObject, "/collision_object", 10)
+        self._joint_state      = None
+        self.create_subscription(JointState, "/joint_states",
+                                 lambda msg: setattr(self, "_joint_state", msg), 10)
+
+    def get_current_joint_position(self, joint_name: str) -> float:
+        """Return the current position of a joint by name, or 0.0 if unavailable."""
+        for _ in range(50):
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self._joint_state is not None:
+                break
+        if self._joint_state is None:
+            self.get_logger().warn(f"No /joint_states received; centering {joint_name} at 0.0")
+            return 0.0
+        try:
+            idx = self._joint_state.name.index(joint_name)
+            return float(self._joint_state.position[idx])
+        except ValueError:
+            self.get_logger().warn(f"{joint_name} not found in /joint_states; using 0.0")
+            return 0.0
 
     # ------------------------------------------------------------------
     # Planning scene
@@ -537,12 +556,13 @@ class PlanAndExecuteClient(Node):
         ]
         mpr.goal_constraints = [goal_c]
 
-        # Path: only constrain joint_6 to prevent >360 degree spin
+        # Path: constrain joint_6 around its current value to prevent multi-revolution spin
+        j6_now = self.get_current_joint_position("joint_6")
         path_c = Constraints()
         path_c.joint_constraints = [
             self._make_joint_constraint(
                 joint_name="joint_6",
-                position=0.0,
+                position=j6_now,
                 tolerance_above=JOINT_6_HALF_WIDTH_RAD,
                 tolerance_below=JOINT_6_HALF_WIDTH_RAD,
             )
@@ -704,7 +724,7 @@ def sequence(node):
         supply_quat   = np.array([0.0, 0.0, 0.0, 1.0])     # flat, no rotation
 
         candidates    = generate_grasp_candidates(supply_pos, supply_quat, is_standing=False)
-        result        = get_best_grasp(candidates, brick_pos=supply_pos, node=node)
+        result        = get_best_grasp(candidates, brick_pos=supply_pos, node=None)
 
         if result is None:
             node.get_logger().error(f"Step {step}: no valid supply grasp — skipping.")

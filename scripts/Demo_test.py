@@ -319,7 +319,7 @@ def generate_grasp_candidates(
         # to swing the brick upright — these work near the floor or as first brick.
         down_quat = rotation_matrix_to_quaternion(brick_rot @ base_down)
         down_quat[2] = -down_quat[2]
-        for sign, label in [(-1.0, "top-edge near (+X)"), (+1.0, "top-edge far (-X)")]:
+        for sign, label in [(+1.0, "top-edge near (+X)"), (-1.0, "top-edge far (-X)")]:
             edge_offset = brick_rot @ np.array([sign * GRASP_EDGE_OFFSET_M, 0.0, 0.0])
             candidates.append((brick_pos + edge_offset, down_quat.copy(), label))
 

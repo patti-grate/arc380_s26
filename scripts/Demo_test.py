@@ -279,7 +279,7 @@ def generate_grasp_candidates(
             gripper_rot_world = brick_rot @ gripper_rot_local
 
             grasp_quat = rotation_matrix_to_quaternion(gripper_rot_world)
-            #grasp_quat[2] = -grasp_quat[2]         
+            grasp_quat[2] = -grasp_quat[2]         
 
             # TCP offset from brick centre
             tilt_rad     = np.radians(tilt_deg)

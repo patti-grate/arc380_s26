@@ -17,7 +17,6 @@ from typing import Optional
 
 import rclpy
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
@@ -123,34 +122,103 @@ assert structure_quaternions.shape[1] == 4, \
 # Grasp optimizer 
 # ---------------------------------------------------------------------------
 
-def _rot_x_180() -> R:
+def _rot_x_180() -> np.ndarray:
     """180 deg around X: flips +Z to -Z."""
-    return R.from_matrix(np.array([
+    return np.array([
         [1,  0,  0],
         [0, -1,  0],
         [0,  0, -1],
-    ], dtype=float))
+    ], dtype=float)
 
 
-def _rot_x_90() -> R:
+def _rot_x_90() -> np.ndarray:
     """90 deg around X: for standing brick roll."""
-    return R.from_matrix(np.array([
+    return np.array([
         [1, 0,  0],
         [0, 0, -1],
         [0, 1,  0],
-    ], dtype=float))
+    ], dtype=float)
 
 
-def _rot_y(deg: float) -> R:
+def _rot_y(deg: float) -> np.ndarray:
     """Rotation around Y axis by deg degrees."""
     rad = np.radians(deg)
     c, s = np.cos(rad), np.sin(rad)
-    return R.from_matrix(np.array([
+    return np.array([
         [ c, 0, s],
         [ 0, 1, 0],
         [-s, 0, c],
-    ], dtype=float))
+    ], dtype=float)
 
+def _quat_tuple_to_xyzw(
+    q, *, components_are_wxyz: bool
+) -> tuple[float, float, float, float]:
+    """Return unit quaternion as (x, y, z, w) for geometry_msgs / MoveIt."""
+    arr = np.asarray(q, dtype=float)
+    if arr.size != 4:
+        raise ValueError(
+            "Quaternion must have exactly 4 scalar components (x,y,z,w or w,x,y,z). "
+            f"Got shape {arr.shape} ({arr.size} elements). "
+            "If you use numpy, use one row per pose, shape (N, 4), not (1, N, 4)."
+        )
+    a = [float(x) for x in arr.ravel()]
+    if components_are_wxyz:
+        w, x, y, z = a[0], a[1], a[2], a[3]
+    else:
+        x, y, z, w = a[0], a[1], a[2], a[3]
+    return (x, y, z, w)
+
+def rotation_matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
+    quaternion = False
+
+    # ================================== YOUR CODE HERE ==================================
+    if matrix.shape == (3, 3):
+        trace = np.trace(matrix)
+        m00, m11, m22 = matrix[0, 0], matrix[1, 1], matrix[2, 2]
+
+        p_squares = np.array([
+        1 + trace,             
+        1 + 2*m00 - trace,   
+        1 + 2*m11 - trace,     
+        1 + 2*m22 - trace    
+        ])
+
+        # Find the index of the largest p_square value
+        i = np.argmax(p_squares)
+        p_i = np.sqrt(p_squares[i])
+
+        # Compute the quaternion components based on the largest p_square index
+        if i == 0:
+            w = 0.5 * p_i
+            x = (matrix[2, 1] - matrix[1, 2]) / (2*p_i)
+            y = (matrix[0, 2] - matrix[2, 0]) / (2*p_i)
+            z = (matrix[1, 0] - matrix[0, 1]) / (2*p_i)
+
+        elif i == 1:
+            x = 0.5 * p_i
+            w = (matrix[2, 1] - matrix[1, 2]) / (2*p_i)
+            y = (matrix[0, 1] + matrix[1, 0]) / (2*p_i)
+            z = (matrix[0, 2] + matrix[2, 0]) / (2*p_i)
+
+        elif i == 2:
+            y = 0.5 * p_i
+            w = (matrix[0, 2] - matrix[2, 0]) / (2*p_i)
+            x = (matrix[0, 1] + matrix[1, 0]) / (2*p_i)
+            z = (matrix[1, 2] + matrix[2, 1]) / (2*p_i)
+
+        else:  # i == 3
+            z = 0.5 * p_i
+            w = (matrix[1, 0] - matrix[0, 1]) / (2*p_i)
+            x = (matrix[0, 2] + matrix[2, 0]) / (2*p_i)
+            y = (matrix[1, 2] + matrix[2, 1]) / (2*p_i)
+
+        quaternion = np.array([w, x, y, z])
+
+        # Normalize the quaternion to ensure it's a unit quaternion
+        quaternion = quaternion / np.linalg.norm(quaternion)
+    # ====================================================================================
+
+    return quaternion
 
 def generate_grasp_candidates(
     brick_pos: np.ndarray,
@@ -177,12 +245,11 @@ def generate_grasp_candidates(
       - Z component of quaternion negated (TCP frame convention)
       - TCP offset from brick centre along approach direction
     """
-    brick_rot  = R.from_quat(brick_quat_xyzw)
+    brick_rot  = _quat_tuple_to_xyzw(brick_quat_xyzw, components_are_wxyz=False)
     base_down  = _rot_x_180()
 
     tilt_angles = [0.0, APPROACH_TILT_DEG, -APPROACH_TILT_DEG]
-    roll_rots   = [R.identity(), _rot_x_90()] if is_standing else [R.identity()]
-
+    roll_rots = [np.eye(3), _rot_x_90()] if is_standing else [np.eye(3)]
     candidates = []
 
     for roll_rot in roll_rots:
@@ -190,10 +257,10 @@ def generate_grasp_candidates(
             tilt_rot = _rot_y(tilt_deg)
 
             # Build gripper orientation: roll -> tilt -> flip Z down
-            gripper_rot_local = roll_rot * tilt_rot * base_down
-            gripper_rot_world = brick_rot * gripper_rot_local
+            gripper_rot_local = roll_rot @ tilt_rot @ base_down
+            gripper_rot_world = brick_rot @ gripper_rot_local
 
-            grasp_quat = gripper_rot_world.as_quat()   # [x, y, z, w]
+            grasp_quat = rotation_matrix_to_quaternion(gripper_rot_world)
             #grasp_quat[2] = -grasp_quat[2]         
 
             # TCP offset from brick centre

@@ -736,6 +736,12 @@ def brick_grab_pos(step: int) -> list:
 # Main sequence
 # ---------------------------------------------------------------------------
 
+def _is_flat_brick(q_xyzw: np.ndarray, threshold: float = 0.9) -> bool:
+    """True if the brick's +Z axis points mostly upward — i.e. the brick is lying flat."""
+    rot = quaternion_to_rotation_matrix(q_xyzw)
+    return float(rot[2, 2]) > threshold
+
+
 def placement_tcp_quat(structure_quat_xyzw: np.ndarray) -> np.ndarray:
     """
     Derive gripper TCP orientation for placing a brick whose body frame is
@@ -760,7 +766,7 @@ def sequence(node):
 
         p_structure    = structure_positions[step]
         q_structure    = structure_quaternions[step]          # brick body [x, y, z, w]
-        q_place_tcp    = placement_tcp_quat(q_structure)      # gripper TCP orientation at placement
+        q_place_tcp    = placement_tcp_quat(q_structure) if _is_flat_brick(q_structure) else q_structure
         p_struct_above = [p_structure[0], p_structure[1],
                           p_structure[2] + PAUSE_OFFSET_Z]
 

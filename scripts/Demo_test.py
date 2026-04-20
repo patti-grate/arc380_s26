@@ -20,9 +20,7 @@ import numpy as np
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
-from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from moveit_msgs.srv import GetMotionPlan
 from moveit_msgs.action import ExecuteTrajectory
@@ -62,10 +60,6 @@ BRICK_DELTA_Y  = -0.06
 PLAN_RETRY_OFFSET_WORLD_M = (-0.01, 0.0, 0.0)
 PLAN_FALLBACK_PLANNER_ID  = "RRTConnect"
 
-# Offset from TCP to brick centre at placement (leave zeros if positions are
-# already brick centres in world frame)
-BRICK_CENTER_OFFSET_TCP_M = (0.0, 0.0, 0.0)
-
 # Gripper positions
 GRIPPER_OPEN   = 0.0
 GRIPPER_CLOSED = 0.01
@@ -87,7 +81,6 @@ JOINT_LOWER = [-2.87979, -1.91986, -1.91986, -2.79253, -2.09440, -6.98132]
 
 # ---------------------------------------------------------------------------
 # Input: structure poses
-# Replace these arrays with your actual brick placement poses.
 # structure_positions:   (N, 3) array of [x, y, z]
 # structure_quaternions: (N, 4) array of [x, y, z, w]
 # ---------------------------------------------------------------------------
@@ -122,7 +115,7 @@ assert structure_quaternions.shape[1] == 4, \
 
 
 # ---------------------------------------------------------------------------
-# Grasp optimizer 
+# Grasp optimizer helper functions for rotation matrices and quaternions
 # ---------------------------------------------------------------------------
 
 def _rot_x_180() -> np.ndarray:
@@ -153,28 +146,10 @@ def _rot_y(deg: float) -> np.ndarray:
         [-s, 0, c],
     ], dtype=float)
 
-def _quat_tuple_to_xyzw(
-    q, *, components_are_wxyz: bool
-) -> tuple[float, float, float, float]:
-    """Return unit quaternion as (x, y, z, w) for geometry_msgs / MoveIt."""
-    arr = np.asarray(q, dtype=float)
-    if arr.size != 4:
-        raise ValueError(
-            "Quaternion must have exactly 4 scalar components (x,y,z,w or w,x,y,z). "
-            f"Got shape {arr.shape} ({arr.size} elements). "
-            "If you use numpy, use one row per pose, shape (N, 4), not (1, N, 4)."
-        )
-    a = [float(x) for x in arr.ravel()]
-    if components_are_wxyz:
-        w, x, y, z = a[0], a[1], a[2], a[3]
-    else:
-        x, y, z, w = a[0], a[1], a[2], a[3]
-    return (x, y, z, w)
 
 def rotation_matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
     quaternion = False
 
-    # ================================== YOUR CODE HERE ==================================
     if matrix.shape == (3, 3):
         trace = np.trace(matrix)
         m00, m11, m22 = matrix[0, 0], matrix[1, 1], matrix[2, 2]
@@ -219,7 +194,6 @@ def rotation_matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
 
         # Normalize the quaternion to ensure it's a unit quaternion
         quaternion = quaternion / np.linalg.norm(quaternion)
-    # ====================================================================================
 
     return quaternion
 
@@ -227,7 +201,6 @@ def quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
 
     rotation_matrix = False
 
-    # ================================== YOUR CODE HERE ==================================
     if quaternion.shape == (4,):
         quaternion = quaternion / np.linalg.norm(quaternion)
         x, y, z, w = quaternion
@@ -237,9 +210,11 @@ def quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
             [2*(x*y + w*z), w**2 - x**2 + y**2 - z**2, 2*(y*z - w*x)],
             [2*(x*z - w*y), 2*(y*z + w*x), w**2 - x**2 - y**2 + z**2]
         ])
-    # ====================================================================================
 
     return rotation_matrix
+# ---------------------------------------------------------------------------
+# Grasp optimizer 
+# ---------------------------------------------------------------------------
 
 def generate_grasp_candidates(
     brick_pos: np.ndarray,
@@ -277,6 +252,8 @@ def generate_grasp_candidates(
     roll_rots = [np.eye(3)]
     candidates = []
 
+    tilt_labels = {0.0: "straight down", APPROACH_TILT_DEG: "45deg tilt from X-", -APPROACH_TILT_DEG: "45deg tilt from X+"}
+
     for roll_rot in roll_rots:
         for tilt_deg in tilt_angles:
             tilt_rot = _rot_y(tilt_deg)
@@ -297,7 +274,7 @@ def generate_grasp_candidates(
             ])
             grasp_pos = brick_pos + brick_rot @ offset_local
 
-            candidates.append((grasp_pos, grasp_quat))
+            candidates.append((grasp_pos, grasp_quat, tilt_labels[tilt_deg]))
 
     if is_standing:
         # Top-edge grasps: straight down but offset toward each long edge of the
@@ -305,9 +282,9 @@ def generate_grasp_candidates(
         # to swing the brick upright — these work near the floor or as first brick.
         down_quat = rotation_matrix_to_quaternion(brick_rot @ base_down)
         down_quat[2] = -down_quat[2]
-        for sign in (+1.0, -1.0):
+        for sign, label in [(+1.0, "top-edge near (+X)"), (-1.0, "top-edge far (-X)")]:
             edge_offset = brick_rot @ np.array([sign * GRASP_EDGE_OFFSET_M, 0.0, 0.0])
-            candidates.append((brick_pos + edge_offset, down_quat.copy()))
+            candidates.append((brick_pos + edge_offset, down_quat.copy(), label))
 
     return candidates
 
@@ -328,15 +305,18 @@ def get_best_grasp(candidates, brick_pos, node=None) -> Optional[tuple]:
     node=...   -> live: tries each via MoveIt, returns first that succeeds.
     """
     if not candidates:
+        print("[grasp] No candidates provided.")
         return None
 
     scored = sorted(candidates, key=lambda c: score_grasp(c[0], c[1], brick_pos))
 
     if node is None:
-        return scored[0]
+        pos, quat, label = scored[0]
+        print(f"[grasp] Selected: {label}")
+        return pos, quat
 
-    for i, (pos, quat) in enumerate(scored):
-        print(f"[grasp] Testing candidate {i+1}/{len(scored)} ...")
+    for i, (pos, quat, label) in enumerate(scored):
+        print(f"[grasp] Trying candidate {i+1}/{len(scored)}: {label}")
         traj = node.plan_arm_to_pose_constraints(
             group_name="arm",
             link_name="gripper_tcp",
@@ -345,9 +325,9 @@ def get_best_grasp(candidates, brick_pos, node=None) -> Optional[tuple]:
             goal_quat_xyzw=tuple(quat),
         )
         if traj is not None:
-            print(f"[grasp] Candidate {i+1} valid")
+            print(f"[grasp] Selected: {label}")
             return pos, quat
-        print(f"[grasp] Candidate {i+1} failed")
+        print(f"[grasp] Candidate {i+1} failed, trying next")
 
     print("[grasp] All candidates failed")
     return None
@@ -377,21 +357,23 @@ class PlanAndExecuteClient(Node):
         self.create_subscription(JointState, "/joint_states",
                                  lambda msg: setattr(self, "_joint_state", msg), 10)
 
-    def get_current_joint_position(self, joint_name: str) -> float:
-        """Return the current position of a joint by name, or 0.0 if unavailable."""
+    def get_all_joint_positions(self) -> dict:
+        """Return current positions for all arm joints as {name: position}."""
         for _ in range(50):
             rclpy.spin_once(self, timeout_sec=0.05)
             if self._joint_state is not None:
                 break
         if self._joint_state is None:
-            self.get_logger().warn(f"No /joint_states received; centering {joint_name} at 0.0")
-            return 0.0
-        try:
-            idx = self._joint_state.name.index(joint_name)
-            return float(self._joint_state.position[idx])
-        except ValueError:
-            self.get_logger().warn(f"{joint_name} not found in /joint_states; using 0.0")
-            return 0.0
+            self.get_logger().warn("No /joint_states received; all joints defaulting to 0.0")
+            return {name: 0.0 for name in JOINT_NAMES}
+        result = {}
+        for name in JOINT_NAMES:
+            try:
+                idx = self._joint_state.name.index(name)
+                result[name] = float(self._joint_state.position[idx])
+            except ValueError:
+                result[name] = 0.0
+        return result
 
     # ------------------------------------------------------------------
     # Planning scene
@@ -573,16 +555,28 @@ class PlanAndExecuteClient(Node):
         ]
         mpr.goal_constraints = [goal_c]
 
-        # Path: constrain joint_6 around its current value to prevent multi-revolution spin
-        j6_now = self.get_current_joint_position("joint_6")
+        # Path: constrain all joints to current value ± tolerance to prevent
+        # the planner picking a far IK solution and making unnecessary large rotations.
+        # Tolerances are intentionally generous — enough to reach any target but
+        # tight enough to prefer the closest IK solution.
+        current_joints = self.get_all_joint_positions()
+        joint_tolerances = {
+            "joint_1": 2.5,   # base — large swings between supply and structure are expected
+            "joint_2": 2.0,
+            "joint_3": 1.8,
+            "joint_4": 2.0,
+            "joint_5": 2.0,
+            "joint_6": JOINT_6_HALF_WIDTH_RAD,
+        }
         path_c = Constraints()
         path_c.joint_constraints = [
             self._make_joint_constraint(
-                joint_name="joint_6",
-                position=j6_now,
-                tolerance_above=JOINT_6_HALF_WIDTH_RAD,
-                tolerance_below=JOINT_6_HALF_WIDTH_RAD,
+                joint_name=name,
+                position=current_joints[name],
+                tolerance_above=joint_tolerances[name],
+                tolerance_below=joint_tolerances[name],
             )
+            for name in JOINT_NAMES
         ]
         mpr.path_constraints = path_c
 
@@ -775,7 +769,8 @@ def sequence(node):
         supply_pos    = np.array(p_supply_raw)
         supply_quat   = np.array([0.0, 0.0, 0.0, 1.0])     # flat, no rotation
 
-        candidates    = generate_grasp_candidates(supply_pos, supply_quat, is_standing=False)
+        placing_standing = not _is_flat_brick(q_structure)
+        candidates    = generate_grasp_candidates(supply_pos, supply_quat, is_standing=placing_standing)
         result        = get_best_grasp(candidates, brick_pos=supply_pos, node=None)
 
         if result is None:

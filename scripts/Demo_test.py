@@ -88,8 +88,7 @@ JOINT_LOWER = [-2.87979, -1.91986, -1.91986, -2.79253, -2.09440, -6.98132]
 # structure_quaternions: (N, 4) array of [x, y, z, w]
 # ---------------------------------------------------------------------------
 
-structure_positions = np.array([   
-                                [0.350319, -0.262939, 0.030500],
+structure_positions = np.array([[0.350319, -0.262939, 0.030500],
                                 [0.355875, -0.262939, 0.075744],
                                 [0.350319, -0.262939, 0.095588],
                                 [0.319363, -0.262939, 0.075744],
@@ -97,7 +96,6 @@ structure_positions = np.array([
                                 [0.349726, -0.250732, 0.155119],
                                 [0.325511, -0.278059, 0.155119],
                                 [0.329196, -0.272444, 0.174963]
-  
 ])
 
 structure_quaternions = np.array([
@@ -285,7 +283,7 @@ def generate_grasp_candidates(
         # brick. Avoids the 45-deg tilt candidates which need vertical clearance
         # to swing the brick upright — these work near the floor or as first brick.
         down_quat = rotation_matrix_to_quaternion(brick_rot @ base_down)
-        down_quat[2] = down_quat[2]
+        down_quat[2] = -down_quat[2]
         for sign, label in [(+1.0, "top-edge near (+X)"), (-1.0, "top-edge far (-X)")]:
             edge_offset = brick_rot @ np.array([sign * GRASP_EDGE_OFFSET_M, 0.0, 0.0])
             candidates.append((brick_pos + edge_offset, down_quat.copy(), label))

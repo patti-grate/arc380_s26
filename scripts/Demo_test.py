@@ -555,28 +555,26 @@ class PlanAndExecuteClient(Node):
         ]
         mpr.goal_constraints = [goal_c]
 
-        # Path: constrain all joints to current value ± tolerance to prevent
-        # the planner picking a far IK solution and making unnecessary large rotations.
-        # Tolerances are intentionally generous — enough to reach any target but
-        # tight enough to prefer the closest IK solution.
-        current_joints = self.get_all_joint_positions()
-        joint_tolerances = {
-            "joint_1": 2.5,   # base — large swings between supply and structure are expected
-            "joint_2": 2.0,
-            "joint_3": 1.8,
-            "joint_4": 2.0,
-            "joint_5": 2.0,
-            "joint_6": JOINT_6_HALF_WIDTH_RAD,
-        }
+        # Path: constrain all joints to their full legal range, plus joint_6
+        # additionally centered on its current value to prevent multi-revolution spin
+        j6_now = self.get_all_joint_positions().get("joint_6", 0.0)
         path_c = Constraints()
         path_c.joint_constraints = [
             self._make_joint_constraint(
                 joint_name=name,
-                position=current_joints[name],
-                tolerance_above=joint_tolerances[name],
-                tolerance_below=joint_tolerances[name],
+                position=(low + high) / 2,
+                tolerance_above=(high - low) / 2,
+                tolerance_below=(high - low) / 2,
             )
-            for name in JOINT_NAMES
+            for name, low, high in zip(JOINT_NAMES, JOINT_LOWER, JOINT_UPPER)
+            if name != "joint_6"
+        ] + [
+            self._make_joint_constraint(
+                joint_name="joint_6",
+                position=j6_now,
+                tolerance_above=JOINT_6_HALF_WIDTH_RAD,
+                tolerance_below=JOINT_6_HALF_WIDTH_RAD,
+            )
         ]
         mpr.path_constraints = path_c
 

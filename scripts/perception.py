@@ -49,7 +49,7 @@ imgpoints = [] # 2d points in image plane.
 
 #relative imports for some reason didn't work for me.. . . 
 #this needs to be a picture of the printed checkerboard for calibration
-fname = "/Users/gratepatrick/dev/arcgroup5/arc380_s26/scripts/calib.jpg"
+fname = "/Users/gratepatti/dev/arcgroup5/arc380_s26/scripts/calib.jpg"
 img = cv2.imread(fname)
 
 # h, w, _ = img.shape

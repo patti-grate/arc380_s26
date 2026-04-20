@@ -296,11 +296,10 @@ def generate_grasp_candidates(
 
 
 def score_grasp(grasp_pos, grasp_quat, brick_pos) -> float:
-    """Lower score = better = tried first."""
-    dist      = float(np.linalg.norm(grasp_pos - ROBOT_BASE_XYZ))
-    to_b      = brick_pos - ROBOT_BASE_XYZ
-    b_dir     = to_b / (np.linalg.norm(to_b) + 1e-9)
-    overshoot = float(np.dot(grasp_pos - ROBOT_BASE_XYZ, b_dir))
+    dist      = float(np.linalg.norm(grasp_pos - ROBOT_BASE_XYZ))       # distance from robot base (prefer closer)
+    to_b      = brick_pos - ROBOT_BASE_XYZ                              # vector from robot base to brick
+    b_dir     = to_b / (np.linalg.norm(to_b) + 1e-9)                    # unit vector from robot base to brick
+    overshoot = float(np.dot(grasp_pos - ROBOT_BASE_XYZ, b_dir))        # prefer grasps that are slightly beyond the brick along the approach direction (helps with collision-free planning)
     return dist + 0.5 * overshoot
 
 
@@ -689,11 +688,10 @@ def sequence(node):
     """
     for step in range(len(structure_positions)):
 
-         # --- DEBUG TEST --- add this block
+        #debug this
         test_pos = np.array(brick_grab_pos(step))
-        test_quat_xyzw = np.array([1.0, 0.0, 0.0, 0.0])  # xyzw
+        test_quat_xyzw = np.array([1.0, 0.0, 0.0, 0.0])
         print(f"\n[DEBUG] Step {step} supply pos: {test_pos}")
-        print(f"[DEBUG] Testing Irene hardcoded quat: {test_quat_xyzw}")
 
         traj = node.plan_arm_to_pose_constraints(
             group_name="arm",

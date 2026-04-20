@@ -693,26 +693,6 @@ def sequence(node):
     """
     for step in range(len(structure_positions)):
 
-        #debug this
-        supply_pos  = np.array(brick_grab_pos(step))
-        supply_quat = np.array([0.0, 0.0, 0.0, 1.0])
-        candidates  = generate_grasp_candidates(supply_pos, supply_quat, is_standing=False)
-
-        for i, (g_pos, g_quat) in enumerate(candidates):
-            hover_pos = g_pos.copy()
-            hover_pos[2] += PAUSE_OFFSET_Z
-            print(f"\n[DEBUG] Step {step} candidate {i}: hover={np.round(hover_pos,4)} quat={np.round(g_quat,4)}")
-            traj = node.plan_arm_to_pose_constraints(
-                group_name="arm",
-                link_name="gripper_tcp",
-                frame_id="world",
-                goal_xyz=tuple(hover_pos),
-                goal_quat_xyzw=tuple(g_quat),
-            )
-            print(f"[DEBUG] Result: {'SUCCESS' if traj else 'FAILED'}")
-        break  # stop after step 0
-
-
         p_structure   = structure_positions[step]
         q_structure   = structure_quaternions[step]          # [x, y, z, w]
         p_struct_above = [p_structure[0], p_structure[1],

@@ -212,7 +212,7 @@ def rotation_matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
             x = (matrix[0, 2] + matrix[2, 0]) / (2*p_i)
             y = (matrix[1, 2] + matrix[2, 1]) / (2*p_i)
 
-        quaternion = np.array([w, x, y, z])
+        quaternion = np.array([x, y, z, w])
 
         # Normalize the quaternion to ensure it's a unit quaternion
         quaternion = quaternion / np.linalg.norm(quaternion)
@@ -227,7 +227,7 @@ def quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
     # ================================== YOUR CODE HERE ==================================
     if quaternion.shape == (4,):
         quaternion = quaternion / np.linalg.norm(quaternion)
-        w, x, y, z = quaternion
+        x, y, z, w = quaternion
 
         rotation_matrix = np.array([
             [w**2 + x**2 - y**2 - z**2, 2*(x*y - w*z), 2*(x*z + w*y)],
@@ -537,16 +537,15 @@ class PlanAndExecuteClient(Node):
         ]
         mpr.goal_constraints = [goal_c]
 
-        # Path: joint 6 constraint to prevent >360 spin
+        # Path: only constrain joint_6 to prevent >360 degree spin
         path_c = Constraints()
         path_c.joint_constraints = [
             self._make_joint_constraint(
-            joint_name=name,
-            position=(low + high) / 2,
-            tolerance_above=(high - low) / 2,
-            tolerance_below=(high - low) / 2,
+                joint_name="joint_6",
+                position=0.0,
+                tolerance_above=JOINT_6_HALF_WIDTH_RAD,
+                tolerance_below=JOINT_6_HALF_WIDTH_RAD,
             )
-            for name, low, high in zip(JOINT_NAMES, JOINT_LOWER, JOINT_UPPER)
         ]
         mpr.path_constraints = path_c
 
@@ -667,12 +666,18 @@ def grip(state: bool, node) -> bool:
 
 def brick_grab_pos(step: int) -> list:
     """Return world position of supply brick at grid index step."""
-    if not (0 <= step <= 19):
-        raise ValueError(f"step must be 0-19, got {step}")
-    x = (step % 4)  * BRICK_DELTA_X + BRICK_OG[0]
-    y = (step // 4) * BRICK_DELTA_Y + BRICK_OG[1]
-    z = BRICK_OG[2]
-    return [x, y, z]
+    if step < 0:
+        return None
+    if step > 19:
+        return None
+    # given brick values 0-19:
+    X = step % 5 # 4 rows
+    Y = step // 4 # 5 columns
+    next_brick_X = X * BRICK_DELTA_X + BRICK_OG[0]
+    next_brick_Y = Y * BRICK_DELTA_Y + BRICK_OG[1]
+    next_brick_Z = BRICK_OG[2]
+    return [next_brick_X, next_brick_Y, next_brick_Z]
+  
 
 
 # ---------------------------------------------------------------------------
@@ -689,20 +694,24 @@ def sequence(node):
     for step in range(len(structure_positions)):
 
         #debug this
-        test_pos = np.array(brick_grab_pos(step))
-        test_quat_xyzw = np.array([1.0, 0.0, 0.0, 0.0])
-        print(f"\n[DEBUG] Step {step} supply pos: {test_pos}")
+        supply_pos  = np.array(brick_grab_pos(step))
+        supply_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        candidates  = generate_grasp_candidates(supply_pos, supply_quat, is_standing=False)
 
-        traj = node.plan_arm_to_pose_constraints(
-            group_name="arm",
-            link_name="gripper_tcp",
-            frame_id="world",
-            goal_xyz=tuple(test_pos),
-            goal_quat_xyzw=tuple(test_quat_xyzw),
-        )
-        print(f"[DEBUG] Result: {'SUCCESS' if traj else 'FAILED'}")
-        break  # only test step 0 for now
-        # --- END DEBUG ---
+        for i, (g_pos, g_quat) in enumerate(candidates):
+            hover_pos = g_pos.copy()
+            hover_pos[2] += PAUSE_OFFSET_Z
+            print(f"\n[DEBUG] Step {step} candidate {i}: hover={np.round(hover_pos,4)} quat={np.round(g_quat,4)}")
+            traj = node.plan_arm_to_pose_constraints(
+                group_name="arm",
+                link_name="gripper_tcp",
+                frame_id="world",
+                goal_xyz=tuple(hover_pos),
+                goal_quat_xyzw=tuple(g_quat),
+            )
+            print(f"[DEBUG] Result: {'SUCCESS' if traj else 'FAILED'}")
+        break  # stop after step 0
+
 
         p_structure   = structure_positions[step]
         q_structure   = structure_quaternions[step]          # [x, y, z, w]

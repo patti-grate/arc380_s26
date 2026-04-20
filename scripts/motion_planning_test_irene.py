@@ -2,7 +2,7 @@ from typing import Optional
 
 import rclpy
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+#from scipy.spatial.transform import Rotation as R
 import sys
 import tty
 import termios
@@ -295,6 +295,7 @@ class PlanAndExecuteClient(Node):
         max_acceleration_scaling: float = 0.2,
         planner_id: str = "",
         joint_6_path_half_width_rad: float | None = None,
+    
     ) -> Optional[RobotTrajectory]:
         mpr = MotionPlanRequest()
         mpr.group_name = group_name

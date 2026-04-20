@@ -555,20 +555,10 @@ class PlanAndExecuteClient(Node):
         ]
         mpr.goal_constraints = [goal_c]
 
-        # Path: constrain all joints to their full legal range, plus joint_6
-        # additionally centered on its current value to prevent multi-revolution spin
+        # Path: constrain joint_6 around its current value to prevent multi-revolution spin
         j6_now = self.get_all_joint_positions().get("joint_6", 0.0)
         path_c = Constraints()
         path_c.joint_constraints = [
-            self._make_joint_constraint(
-                joint_name=name,
-                position=(low + high) / 2,
-                tolerance_above=(high - low) / 2,
-                tolerance_below=(high - low) / 2,
-            )
-            for name, low, high in zip(JOINT_NAMES, JOINT_LOWER, JOINT_UPPER)
-            if name != "joint_6"
-        ] + [
             self._make_joint_constraint(
                 joint_name="joint_6",
                 position=j6_now,

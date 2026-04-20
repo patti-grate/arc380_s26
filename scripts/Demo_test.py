@@ -736,6 +736,19 @@ def brick_grab_pos(step: int) -> list:
 # Main sequence
 # ---------------------------------------------------------------------------
 
+def placement_tcp_quat(structure_quat_xyzw: np.ndarray) -> np.ndarray:
+    """
+    Derive gripper TCP orientation for placing a brick whose body frame is
+    described by structure_quat_xyzw. Mirrors the grasp optimizer: approach
+    along the brick's +Z axis with the gripper pointing down (_rot_x_180).
+    """
+    brick_rot = quaternion_to_rotation_matrix(structure_quat_xyzw)
+    tcp_rot   = brick_rot @ _rot_x_180()
+    tcp_quat  = rotation_matrix_to_quaternion(tcp_rot)
+    tcp_quat[2] = -tcp_quat[2]   # TCP frame convention (same as grasp optimizer)
+    return tcp_quat
+
+
 def sequence(node):
     """
     For each brick in structure_positions / structure_quaternions:
@@ -745,8 +758,9 @@ def sequence(node):
     """
     for step in range(len(structure_positions)):
 
-        p_structure   = structure_positions[step]
-        q_structure   = structure_quaternions[step]          # [x, y, z, w]
+        p_structure    = structure_positions[step]
+        q_structure    = structure_quaternions[step]          # brick body [x, y, z, w]
+        q_place_tcp    = placement_tcp_quat(q_structure)      # gripper TCP orientation at placement
         p_struct_above = [p_structure[0], p_structure[1],
                           p_structure[2] + PAUSE_OFFSET_Z]
 
@@ -777,13 +791,13 @@ def sequence(node):
         # 4. Move back above supply
         move(p_supply_above, q_supply, node)
         # 5. Move above structure position
-        move(p_struct_above, q_structure, node)
+        move(p_struct_above, q_place_tcp, node)
         # 6. Move down to structure position
-        move(p_structure, q_structure, node)
+        move(p_structure, q_place_tcp, node)
         # 7. Ungrip
         grip(False, node)
         # 8. Move back above structure position
-        move(p_struct_above, q_structure, node)
+        move(p_struct_above, q_place_tcp, node)
 
         # Add placed brick to planning scene so future steps avoid it
         node.publish_scene_box(

@@ -74,6 +74,7 @@ GRIPPER_CLOSED = 0.01
 ROBOT_BASE_XYZ    = np.array([0.0, 0.0, 0.0])
 APPROACH_TILT_DEG = 45.0
 GRASP_STANDOFF_X_M = 0.02   # lateral offset for tilted approaches (tune to avoid neighbours)
+GRASP_EDGE_OFFSET_M = 0.020  # X offset toward long edge for top-down standing grasps
 
 # Joint 6 path constraint — prevents multi-revolution spin
 JOINT_6_HALF_WIDTH_RAD = 2.0
@@ -267,7 +268,11 @@ def generate_grasp_candidates(
     base_down  = _rot_x_180()
 
     tilt_angles = [0.0, APPROACH_TILT_DEG, -APPROACH_TILT_DEG]
-    roll_rots = [np.eye(3), _rot_x_90()] if is_standing else [np.eye(3)]
+    # For standing bricks, only use flat tilt=0 here; the 90-deg roll candidates
+    # are commented out until perception is integrated to judge stack height —
+    # they require vertical clearance to swing the brick upright mid-trajectory.
+    # roll_rots = [np.eye(3), _rot_x_90()] if is_standing else [np.eye(3)]
+    roll_rots = [np.eye(3)]
     candidates = []
 
     for roll_rot in roll_rots:
@@ -279,7 +284,7 @@ def generate_grasp_candidates(
             gripper_rot_world = brick_rot @ gripper_rot_local
 
             grasp_quat = rotation_matrix_to_quaternion(gripper_rot_world)
-            grasp_quat[2] = -grasp_quat[2]         
+            grasp_quat[2] = -grasp_quat[2]
 
             # TCP offset from brick centre
             tilt_rad     = np.radians(tilt_deg)
@@ -291,6 +296,16 @@ def generate_grasp_candidates(
             grasp_pos = brick_pos + brick_rot @ offset_local
 
             candidates.append((grasp_pos, grasp_quat))
+
+    if is_standing:
+        # Top-edge grasps: straight down but offset toward each long edge of the
+        # brick. Avoids the 45-deg tilt candidates which need vertical clearance
+        # to swing the brick upright — these work near the floor or as first brick.
+        down_quat = rotation_matrix_to_quaternion(brick_rot @ base_down)
+        down_quat[2] = -down_quat[2]
+        for sign in (+1.0, -1.0):
+            edge_offset = brick_rot @ np.array([sign * GRASP_EDGE_OFFSET_M, 0.0, 0.0])
+            candidates.append((brick_pos + edge_offset, down_quat.copy()))
 
     return candidates
 
@@ -646,7 +661,8 @@ class PlanAndExecuteClient(Node):
 def move(position, quat_xyzw, node, enable_retry=True) -> bool:
     """
     Plan and execute gripper_tcp to (position, quat_xyzw) in world frame.
-    Retries once with PLAN_RETRY_OFFSET_WORLD_M if planning fails.
+    Retry 1: small position offset + RRTConnect (same tight tolerances).
+    Retry 2: original position, looser orientation tolerance, more time.
     """
     pos = np.asarray(position, dtype=float).ravel()
 
@@ -671,10 +687,24 @@ def move(position, quat_xyzw, node, enable_retry=True) -> bool:
             planner_id=PLAN_FALLBACK_PLANNER_ID,
         )
 
+    if traj is None and enable_retry:
+        node.get_logger().warn("Planning failed — retrying with relaxed orientation tolerance")
+        traj = node.plan_arm_to_pose_constraints(
+            group_name="arm",
+            link_name="gripper_tcp",
+            frame_id="world",
+            goal_xyz=tuple(pos),
+            goal_quat_xyzw=tuple(quat_xyzw),
+            ori_tolerance_rpy=(0.05, 0.05, 0.05),
+            allowed_planning_time=10.0,
+            num_attempts=10,
+            planner_id=PLAN_FALLBACK_PLANNER_ID,
+        )
+
     if traj is not None:
         return node.execute_moveit_trajectory(traj)
 
-    node.get_logger().error("Planning failed including retry.")
+    node.get_logger().error("Planning failed after all retries.")
     return False
 
 

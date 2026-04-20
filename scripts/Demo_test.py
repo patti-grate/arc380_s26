@@ -48,8 +48,11 @@ from control_msgs.action import FollowJointTrajectory, ParallelGripperCommand
 # Brick dimensions in metres — match your model.sdf
 BRICK_SIZE_XYZ = (0.051, 0.023, 0.014)
 
-# How far above a pose to hover before moving down
+# How far above a pose to hover before moving down (supply side)
 PAUSE_OFFSET_Z = 0.1
+# How far above the structure position to retreat after placing — larger than
+# supply hover to clear placed bricks as the stack grows
+STRUCTURE_RETREAT_Z = 0.15
 
 # Supply brick grid origin and spacing
 BRICK_OG       = [0.000,  0.480, 0.032]
@@ -750,7 +753,7 @@ def sequence(node):
         q_structure    = structure_quaternions[step]          # brick body [x, y, z, w]
         q_place_tcp    = placement_tcp_quat(q_structure) if _is_flat_brick(q_structure) else q_structure
         p_struct_above = [p_structure[0], p_structure[1],
-                          p_structure[2] + PAUSE_OFFSET_Z]
+                          p_structure[2] + STRUCTURE_RETREAT_Z]
 
         # --- Grasp optimization for supply brick ---
         p_supply_raw  = brick_grab_pos(step)
@@ -785,10 +788,7 @@ def sequence(node):
         move(p_structure, q_place_tcp, node)
         # 7. Ungrip
         grip(False, node)
-        # 8. Move back above structure position
-        move(p_struct_above, q_place_tcp, node)
-
-        # Add placed brick to planning scene so future steps avoid it
+        # 8. Register placed brick in scene BEFORE retreating so MoveIt plans around it
         node.publish_scene_box(
             object_id=f"placed_brick_{step}",
             frame_id="world",
@@ -796,6 +796,8 @@ def sequence(node):
             position_xyz=tuple(p_structure),
             quat_xyzw=tuple(q_structure),
         )
+        # 9. Retreat above structure — brick is now in scene so path routes around it
+        move(p_struct_above, q_place_tcp, node)
 
     return True
 

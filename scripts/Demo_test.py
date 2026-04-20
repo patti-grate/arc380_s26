@@ -220,6 +220,24 @@ def rotation_matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
 
     return quaternion
 
+def quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
+
+    rotation_matrix = False
+
+    # ================================== YOUR CODE HERE ==================================
+    if quaternion.shape == (4,):
+        quaternion = quaternion / np.linalg.norm(quaternion)
+        w, x, y, z = quaternion
+
+        rotation_matrix = np.array([
+            [w**2 + x**2 - y**2 - z**2, 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), w**2 - x**2 + y**2 - z**2, 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), w**2 - x**2 - y**2 + z**2]
+        ])
+    # ====================================================================================
+
+    return rotation_matrix
+
 def generate_grasp_candidates(
     brick_pos: np.ndarray,
     brick_quat_xyzw: np.ndarray,
@@ -245,7 +263,7 @@ def generate_grasp_candidates(
       - Z component of quaternion negated (TCP frame convention)
       - TCP offset from brick centre along approach direction
     """
-    brick_rot  = _quat_tuple_to_xyzw(brick_quat_xyzw, components_are_wxyz=False)
+    brick_rot  = quaternion_to_rotation_matrix(brick_quat_xyzw)
     base_down  = _rot_x_180()
 
     tilt_angles = [0.0, APPROACH_TILT_DEG, -APPROACH_TILT_DEG]
@@ -270,7 +288,7 @@ def generate_grasp_candidates(
                  0.0,                                    # Y: centred on short axis
                  np.cos(tilt_rad) * GRASP_STANDOFF_M,  # Z: above brick
             ])
-            grasp_pos = brick_pos + brick_rot.apply(offset_local)
+            grasp_pos = brick_pos + brick_rot @ offset_local
 
             candidates.append((grasp_pos, grasp_quat))
 

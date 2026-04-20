@@ -27,6 +27,7 @@ from moveit_msgs.msg import (
     RobotTrajectory,
     JointConstraint,
     CollisionObject,
+    AttachedCollisionObject,
     PlanningSceneComponents,
 )
 
@@ -92,6 +93,62 @@ class PlanAndExecuteClient(Node):
         self._collision_object_pub = self.create_publisher(
             CollisionObject, "/collision_object", _COLLISION_OBJECT_QOS
         )
+        self._attached_object_pub = self.create_publisher(
+            AttachedCollisionObject, "/attached_collision_object", _COLLISION_OBJECT_QOS
+        )
+
+    def attach_box_to_gripper(
+        self,
+        object_id: str,
+        size_xyz: tuple[float, float, float],
+        link_name: str = "gripper_tcp",
+        touch_links: list[str] | None = None
+    ) -> None:
+        """
+        Attaches a generated collision box to the specified link (default: gripper_tcp).
+        MoveIt will then avoid collisions between this box and the scene.
+        (Called BEFORE planning the transit phases.)
+        """
+        aco = AttachedCollisionObject()
+        aco.link_name = link_name
+        aco.object.header.frame_id = link_name
+        aco.object.id = object_id
+        aco.object.operation = CollisionObject.ADD
+
+        # Box centered at the TCP, adjust position if the offset isn't strictly 0
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [float(size_xyz[0]), float(size_xyz[1]), float(size_xyz[2])]
+
+        prim_pose = Pose()
+        prim_pose.orientation.w = 1.0  # Identity against tcp
+
+        aco.object.primitives = [box]
+        aco.object.primitive_poses = [prim_pose]
+        
+        if touch_links is None:
+            # Let it ignore collisions with the gripper fingers
+            aco.touch_links = [
+                "gripper_tcp", "link_6", "link_5", 
+                "gripper_base", "left_finger", "right_finger"
+            ]
+        else:
+            aco.touch_links = touch_links
+
+        for _ in range(5):
+            self._attached_object_pub.publish(aco)
+            time.sleep(0.02)
+            
+    def detach_box_from_gripper(self, object_id: str) -> None:
+        """
+        Detaches and removes the object.
+        """
+        aco = AttachedCollisionObject()
+        aco.object.id = object_id
+        aco.object.operation = CollisionObject.REMOVE
+        for _ in range(5):
+            self._attached_object_pub.publish(aco)
+            time.sleep(0.02)
 
     def publish_scene_box(
         self,
@@ -415,7 +472,9 @@ class PlanAndExecuteClient(Node):
         max_velocity_scaling: float = 0.2,
         max_acceleration_scaling: float = 0.2,
         planner_id: str = "",
+        joint_4_constraints: float | None = None,
         joint_6_constraints: float | None = None,
+        lock_wrist_to_start: bool = False,
     ) -> Optional[RobotTrajectory]:
         mpr = MotionPlanRequest()
         mpr.group_name = group_name
@@ -427,18 +486,48 @@ class PlanAndExecuteClient(Node):
                 start_joint_names, start_joint_positions
             )
 
-        if joint_6_constraints is not None:
-            w = float(joint_6_constraints)
+        if joint_4_constraints is not None or joint_6_constraints is not None:
             path_c = Constraints()
-            path_c.joint_constraints = [
-                self._make_joint_constraint(
-                    joint_name="joint_6",
-                    position=0.0,
-                    tolerance_above=w,
-                    tolerance_below=w,
+            if joint_4_constraints is not None:
+                w4 = float(joint_4_constraints)
+                path_c.joint_constraints.append(
+                    self._make_joint_constraint(
+                        joint_name="joint_4",
+                        position=0.0,
+                        tolerance_above=w4,
+                        tolerance_below=w4,
+                    )
                 )
-            ]
+            if joint_6_constraints is not None:
+                w6 = float(joint_6_constraints)
+                path_c.joint_constraints.append(
+                    self._make_joint_constraint(
+                        joint_name="joint_6",
+                        position=0.0,
+                        tolerance_above=w6,
+                        tolerance_below=w6,
+                    )
+                )
             mpr.path_constraints = path_c
+
+        if lock_wrist_to_start and start_joint_names is not None and start_joint_positions is not None:
+            path_c = mpr.path_constraints
+            if not path_c.joint_constraints:  # if empty
+                mpr.path_constraints = Constraints()
+                path_c = mpr.path_constraints
+            
+            for jname in ["joint_4", "joint_5", "joint_6"]:
+                if jname in start_joint_names:
+                    idx = start_joint_names.index(jname)
+                    pos = start_joint_positions[idx]
+                    path_c.joint_constraints.append(
+                        self._make_joint_constraint(
+                            joint_name=jname,
+                            position=pos,
+                            tolerance_above=0.4,
+                            tolerance_below=0.4,
+                        )
+                    )
 
         constraints = Constraints()
         constraints.position_constraints = [

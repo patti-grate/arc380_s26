@@ -689,6 +689,23 @@ def sequence(node):
     """
     for step in range(len(structure_positions)):
 
+         # --- DEBUG TEST --- add this block
+        test_pos = np.array(brick_grab_pos(step))
+        test_quat_xyzw = np.array([1.0, 0.0, 0.0, 0.0])  # xyzw
+        print(f"\n[DEBUG] Step {step} supply pos: {test_pos}")
+        print(f"[DEBUG] Testing Irene hardcoded quat: {test_quat_xyzw}")
+
+        traj = node.plan_arm_to_pose_constraints(
+            group_name="arm",
+            link_name="gripper_tcp",
+            frame_id="world",
+            goal_xyz=tuple(test_pos),
+            goal_quat_xyzw=tuple(test_quat_xyzw),
+        )
+        print(f"[DEBUG] Result: {'SUCCESS' if traj else 'FAILED'}")
+        break  # only test step 0 for now
+        # --- END DEBUG ---
+
         p_structure   = structure_positions[step]
         q_structure   = structure_quaternions[step]          # [x, y, z, w]
         p_struct_above = [p_structure[0], p_structure[1],

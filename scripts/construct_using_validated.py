@@ -165,7 +165,7 @@ T_GRASP_OFFSETS: dict[str, np.ndarray] = {
 GRASP_ORDER: list[str] = ["grasp1", "grasp2", "grasp3", "grasp4"]
 
 # Default supply pallet pose -- x, y, z (flat brick, no rotation for now)
-DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (0.0, -0.48, 0.030)
+DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (0.0, 0.48, 0.030)
 DEFAULT_SUPPLY_QUAT_XYZW: tuple[float, float, float, float] = (
     0.0,
     0.0,
@@ -175,6 +175,11 @@ DEFAULT_SUPPLY_QUAT_XYZW: tuple[float, float, float, float] = (
 
 # Extra Z lift above pickup / placement for hover waypoints (metres)
 DEFAULT_HOVER_Z: float = 0.12
+
+# Safe home joint configuration -- elevated slightly above table to avoid
+# MoveIt goal-state collision rejection at the Gazebo spawn frame.
+SAFE_HOME_NAMES: list[str] = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+SAFE_HOME_POSITIONS: list[float] = [1.57, 0.30, -0.18, 0.0, 0.94, -1.57]
 
 # Gazebo SDF path for bricks (used in --sim mode for visual spawning)
 _SDF_PATH = os.path.normpath(
@@ -427,6 +432,81 @@ def hover_above(
 
 
 # ===========================================================================
+# Trajectory serialization  (export / replay)
+# ===========================================================================
+
+_PHASE_LABELS = [
+    "hover_supply", "grasp_supply", "lift_supply",
+    "hover_goal", "place_goal", "retract_goal", "return_home",
+]
+
+
+def _serialize_traj(traj) -> dict:
+    """Convert a RobotTrajectory to a plain dict suitable for JSON."""
+    jt = traj.joint_trajectory
+    pts = []
+    for p in jt.points:
+        pts.append({
+            "positions": list(p.positions),
+            "velocities": list(p.velocities),
+            "accelerations": list(p.accelerations),
+            "t_sec": p.time_from_start.sec,
+            "t_nanosec": p.time_from_start.nanosec,
+        })
+    return {"joint_names": list(jt.joint_names), "points": pts}
+
+
+def _deserialize_traj(data: dict):
+    """Reconstruct a RobotTrajectory from a serialized dict."""
+    if not HAVE_ROS2:
+        return None
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from moveit_msgs.msg import RobotTrajectory as _RT
+    from builtin_interfaces.msg import Duration
+
+    jt = JointTrajectory()
+    jt.joint_names = data["joint_names"]
+    for d in data["points"]:
+        pt = JointTrajectoryPoint()
+        pt.positions = d["positions"]
+        pt.velocities = d.get("velocities", [])
+        pt.accelerations = d.get("accelerations", [])
+        pt.time_from_start = Duration(sec=d["t_sec"], nanosec=d["t_nanosec"])
+        jt.points.append(pt)
+
+    rt = _RT()
+    rt.joint_trajectory = jt
+    return rt
+
+
+def _build_brick_steps(plans: list, goal_7d: np.ndarray, supply_7d: np.ndarray,
+                       grasp_id: str, fallback_desc: str, brick_idx: int) -> dict:
+    """
+    Package a brick's 7 planned trajectories + gripper commands into a
+    JSON-serializable dict that _run_replay() can execute without replanning.
+    """
+    steps = []
+    steps.append({"type": "gripper", "action": "open"})
+    for label, traj in zip(_PHASE_LABELS, plans):
+        if traj is not None:
+            steps.append({"type": "traj", "label": label, **_serialize_traj(traj)})
+        if label == "grasp_supply":
+            steps.append({"type": "gripper", "action": "close"})
+            steps.append({"type": "sleep", "sec": 0.5})
+        elif label == "place_goal":
+            steps.append({"type": "gripper", "action": "open"})
+            steps.append({"type": "sleep", "sec": 0.5})
+    return {
+        "brick_idx": brick_idx,
+        "grasp_id": grasp_id,
+        "fallback_desc": fallback_desc,
+        "goal_7d": goal_7d.tolist(),
+        "supply_7d": supply_7d.tolist(),
+        "steps": steps,
+    }
+
+
+# ===========================================================================
 # Per-brick pick-and-place planner
 # ===========================================================================
 
@@ -467,12 +547,25 @@ def plan_brick_sequence(
 
     if node is None:
         # Offline mode
-        return [None] * 6  # type: ignore
+        return [None] * 7  # type: ignore
+
+    # ------------------------------------------------------------------
+    # Fast IK pre-check: reject geometrically infeasible poses in ~10 ms
+    # before spending up to 6 s on OMPL per phase.
+    # ------------------------------------------------------------------
+    if not node.check_ik("arm", "gripper_tcp", "world", supply_tcp_xyz, supply_tcp_quat):
+        log_info(f"    [IK SKIP] Supply TCP infeasible for {grasp_id}")
+        return None
+    if not node.check_ik("arm", "gripper_tcp", "world", goal_tcp_xyz, goal_tcp_quat):
+        log_info(f"    [IK SKIP] Goal TCP infeasible for {grasp_id}")
+        return None
 
     plans = []
     current_start_state = None
 
-    def _plan_phase(label: str, xyz, quat, lock_wrist: bool = False) -> bool:
+    def _plan_phase(
+        label: str, xyz, quat, lock_wrist: bool = False, wrist_tolerance: float = 0.4
+    ) -> bool:
         nonlocal current_start_state
         start_names, start_positions = (
             current_start_state if current_start_state else (None, None)
@@ -484,13 +577,14 @@ def plan_brick_sequence(
             frame_id="world",
             goal_xyz=tuple(float(v) for v in xyz),
             goal_quat_xyzw=tuple(float(v) for v in quat),
-            joint_4_constraints=3.14,  # Expanded to 180 deg. +/- 90 degrees breaks IK workspace routing.
+            joint_4_constraints=3.14,  # ±π keeps IK workspace routing intact
             joint_6_constraints=3.14,
             allowed_planning_time=6.0,
             num_attempts=5,
             start_joint_names=start_names,
             start_joint_positions=start_positions,
             lock_wrist_to_start=lock_wrist,
+            lock_wrist_tolerance=wrist_tolerance,
         )
         if traj is None:
             log_info(f"    [FAIL] Plan failed at {label} for {grasp_id}")
@@ -499,6 +593,20 @@ def plan_brick_sequence(
         plans.append(traj)
         next_state = _extract_last_state(traj)
         if next_state:
+            # Warn if j6 rotated more than ~120° during this phase so we can
+            # track wrist-spin without blocking planning.
+            if current_start_state:
+                prev_names, prev_pos = current_start_state
+                if "joint_6" in prev_names:
+                    j6_prev = prev_pos[prev_names.index("joint_6")]
+                    new_names, new_pos = next_state
+                    if "joint_6" in new_names:
+                        j6_delta = abs(new_pos[new_names.index("joint_6")] - j6_prev)
+                        if j6_delta > 2.09:  # 2.09 rad ≈ 120°
+                            log_info(
+                                f"    [j6-spin] {label}: j6 rotated "
+                                f"{j6_delta:.2f} rad ({np.degrees(j6_delta):.0f}°)"
+                            )
             current_start_state = next_state
         return True
 
@@ -521,16 +629,56 @@ def plan_brick_sequence(
             "lift_supply", supply_hover, supply_tcp_quat, lock_wrist=True
         ):
             return None
+        # hover_goal is the long transit: do NOT lock the wrist here.
+        # Locking j6 to the lift-supply end value causes OMPL to fail when
+        # the natural IK solution requires a wrist rotation > the tolerance
+        # (observed: ~3.1 rad change in j6 between lift and hover_goal).
+        # The spin is cosmetic; correctness requires leaving the wrist free.
         if not _plan_phase("hover_goal", goal_hover, goal_tcp_quat):
             return None
         if not _plan_phase("place_goal", goal_tcp_xyz, goal_tcp_quat, lock_wrist=True):
             return None
     finally:
-        # GHOST DETACH: Ensure we always release the ghost object, even on failure
+        # GHOST DETACH: Release the attached object.  MoveIt puts detached objects
+        # back into the world scene at the gripper TCP position -- explicitly remove
+        # it so it doesn't block subsequent bricks' path planning.
         if node:
             node.detach_box_from_gripper(ghost_id)
+            node.remove_scene_object(ghost_id)
 
     if not _plan_phase("retract_goal", goal_hover, goal_tcp_quat, lock_wrist=True):
+        return None
+
+    def _plan_return_home() -> bool:
+        nonlocal current_start_state
+            
+        start_names, start_positions = (
+            current_start_state if current_start_state else (None, None)
+        )
+        t_names = SAFE_HOME_NAMES
+        t_positions = SAFE_HOME_POSITIONS
+        
+        traj = node.plan_gripper_to_joint_positions(
+            group_name="arm",
+            goal_joint_names=t_names,
+            goal_joint_positions=t_positions,
+            start_joint_names=start_names,
+            start_joint_positions=start_positions,
+            tolerance=0.08,
+            allowed_planning_time=6.0,
+            num_attempts=5,
+        )
+        if traj is None:
+            log_info(f"    [FAIL] Plan failed at return_home for {grasp_id}")
+            return False
+            
+        plans.append(traj)
+        next_state = _extract_last_state(traj)
+        if next_state:
+            current_start_state = next_state
+        return True
+
+    if not _plan_return_home():
         return None
 
     return plans
@@ -604,6 +752,11 @@ def execute_brick_sequence(
     if not _exec("retract_goal", plans[5]):
         return False
 
+    # 9. Return to home state
+    if len(plans) > 6 and plans[6] is not None:
+        if not _exec("return_home", plans[6]):
+            return False
+
     return True
 
 
@@ -621,6 +774,7 @@ def run_construction(
     hover_z: float,
     mode: str,
     forced_grasp: Optional[str],
+    export_dir: Optional[str] = None,
 ) -> None:
     """
     Iterate through the demo sequence and pick-and-place each brick.
@@ -636,6 +790,7 @@ def run_construction(
     placed_count = 0
     failed_bricks: list[int] = []
     spawned_gz_names: list[str] = []  # tracked for potential cleanup
+    export_sequence: list[dict] = []  # filled when export_dir is set
 
     print(f"\n[construct] Starting construction -- {len(demo_poses)} bricks")
     mode_label = {
@@ -659,6 +814,26 @@ def run_construction(
             position_xyz=(0.0, 0.0, -0.02),
         )
 
+    # Ensure the robot is physically at the exact SAFE_HOME_POSITIONS before any plans run
+    if node is not None and mode in [MODE_SIM, MODE_REAL]:
+        print("[construct] Physically aligning to SAFE_HOME to initialize geometric baseline...")
+        init_traj = node.plan_gripper_to_joint_positions(
+            group_name="arm",
+            goal_joint_names=SAFE_HOME_NAMES,
+            goal_joint_positions=SAFE_HOME_POSITIONS,
+            start_joint_names=None,
+            start_joint_positions=None,
+            tolerance=0.08,
+            allowed_planning_time=10.0,
+            num_attempts=5,
+        )
+        if init_traj:
+            node.execute_moveit_trajectory(init_traj)
+            # Make sure gripper is open initially
+            node.send_gripper_command(position=0.011, max_velocity=0.05)
+        else:
+            print("[WARN] Initialization move to SAFE_HOME failed. First trajectory might reject!")
+
     supply_7d_base = np.array([*supply_xyz, *supply_quat_xyzw])
 
     for brick_idx, original_goal_7d in enumerate(demo_poses):
@@ -680,6 +855,7 @@ def run_construction(
         best_goal_7d = None
         best_supply_7d = None
         best_desc = None
+        best_grasp_id = None
 
         gz_name = f"construct_brick_{brick_idx:03d}"
 
@@ -709,6 +885,7 @@ def run_construction(
                     best_goal_7d = fb_goal_7d
                     best_supply_7d = fb_supply_7d
                     best_desc = fallback_desc
+                    best_grasp_id = grasp_id
                     break
 
         if best_plans is None:
@@ -736,6 +913,15 @@ def run_construction(
         if mode == MODE_SIM:
             spawned_gz_names.append(gz_name)
 
+        # Collect export data (only when all phases are real trajectories)
+        if export_dir is not None and all(p is not None for p in best_plans):
+            export_sequence.append(
+                _build_brick_steps(
+                    best_plans, best_goal_7d, best_supply_7d,
+                    best_grasp_id, best_desc, brick_idx,
+                )
+            )
+
         # Register the placed brick as a permanent MoveIt collision object.
         if node is not None:
             brick_obj_id = f"placed_brick_{brick_idx:03d}"
@@ -753,6 +939,23 @@ def run_construction(
         if not (mode == MODE_DRY_RUN):
             time.sleep(1.0)
 
+    # -- Export ------------------------------------------------------------
+    if export_dir is not None and not failed_bricks and export_sequence:
+        os.makedirs(export_dir, exist_ok=True)
+        # Use demo name derived from the data path or a generic timestamp
+        export_path = os.path.join(export_dir, "planned_sequence.json")
+        payload = {
+            "supply_xyz": list(supply_xyz),
+            "supply_quat_xyzw": list(supply_quat_xyzw),
+            "hover_z": hover_z,
+            "bricks": export_sequence,
+        }
+        with open(export_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"[construct] Trajectories exported to {export_path}")
+    elif export_dir is not None and failed_bricks:
+        print("[construct] Export skipped: construction was not fully successful.")
+
     # -- Summary -----------------------------------------------------------
     print(f"\n{'=' * 60}")
     print(f"[construct] Construction complete.")
@@ -761,6 +964,105 @@ def run_construction(
     if spawned_gz_names:
         print(f"  Gazebo bricks spawned: {len(spawned_gz_names)}")
     print(f"{'=' * 60}\n")
+
+
+# ===========================================================================
+# Replay (execute pre-planned trajectories without replanning)
+# ===========================================================================
+
+
+def run_replay(
+    node: Optional["PlanAndExecuteClient"],
+    sequence_path: str,
+    *,
+    mode: str,
+) -> None:
+    """
+    Load a JSON sequence exported by run_construction (--export-dir) and
+    execute every brick's pre-planned trajectories without calling MoveIt
+    planning at all.  Collision objects are still registered after each
+    placement so MoveIt's execution monitor stays consistent.
+    """
+    with open(sequence_path) as f:
+        data = json.load(f)
+
+    bricks = data["bricks"]
+    hover_z = data.get("hover_z", DEFAULT_HOVER_Z)
+    supply_xyz = tuple(data.get("supply_xyz", DEFAULT_SUPPLY_XYZ))
+    print(f"[replay] Loaded {len(bricks)} bricks from {sequence_path}")
+
+    dry_run = mode == MODE_DRY_RUN
+
+    if node is not None:
+        node.publish_scene_box(
+            object_id="table_surface",
+            frame_id="world",
+            size_xyz=(2.0, 2.0, 0.02),
+            position_xyz=(0.0, 0.0, -0.02),
+        )
+
+    # Move to SAFE_HOME first (needs one planning call to seed the controller)
+    if node is not None and not dry_run:
+        print("[replay] Homing to SAFE_HOME before replay...")
+        init_traj = node.plan_gripper_to_joint_positions(
+            group_name="arm",
+            goal_joint_names=SAFE_HOME_NAMES,
+            goal_joint_positions=SAFE_HOME_POSITIONS,
+            tolerance=0.08,
+            allowed_planning_time=10.0,
+            num_attempts=5,
+        )
+        if init_traj:
+            node.execute_moveit_trajectory(init_traj)
+            node.send_gripper_command(position=0.011, max_velocity=0.05)
+        else:
+            print("[replay][WARN] SAFE_HOME init failed; first execution may reject.")
+
+    print(f"\n[replay] Starting replay -- mode={mode}\n")
+
+    for brick_data in bricks:
+        brick_idx = brick_data["brick_idx"]
+        print(
+            f"\n[replay] -- Brick {brick_idx + 1}/{len(bricks)} "
+            f"grasp={brick_data['grasp_id']} ({brick_data['fallback_desc']}) --"
+        )
+
+        for step in brick_data["steps"]:
+            stype = step["type"]
+            if stype == "traj":
+                if not dry_run and node is not None:
+                    traj = _deserialize_traj(step)
+                    node.execute_moveit_trajectory(traj)
+                else:
+                    print(f"    [dry] execute {step['label']}")
+            elif stype == "gripper":
+                if not dry_run and node is not None:
+                    pos = 0.01 if step["action"] == "close" else 0.0
+                    node.send_gripper_command(position=pos, max_velocity=0.05)
+                    if step["action"] == "close":
+                        time.sleep(0.1)  # brief settle before lift
+                else:
+                    print(f"    [dry] gripper {step['action']}")
+            elif stype == "sleep":
+                if not dry_run:
+                    time.sleep(step["sec"])
+
+        # Re-register the placed brick in MoveIt for execution safety
+        if node is not None:
+            goal_7d = np.array(brick_data["goal_7d"])
+            node.publish_scene_box(
+                object_id=f"placed_brick_{brick_idx:03d}",
+                frame_id="world",
+                size_xyz=BRICK_SIZE_XYZ,
+                position_xyz=tuple(float(v) for v in goal_7d[:3]),
+                quat_xyzw=tuple(float(v) for v in goal_7d[3:]),
+            )
+            print(f"  [scene] registered placed_brick_{brick_idx:03d}")
+
+        if not dry_run:
+            time.sleep(1.0)
+
+    print(f"\n[replay] Complete -- {len(bricks)} bricks executed.")
 
 
 # ===========================================================================
@@ -774,7 +1076,7 @@ def parse_args() -> argparse.Namespace:
             os.path.dirname(__file__),
             "..",
             "training_data",
-            "batch1",
+            "batch0",
             "validated_simPhysics",
         )
     )
@@ -797,7 +1099,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data-dir",
         default=default_data,
-        help="Root directory of validated sequences (default: training_data/batch1/validated_simPhysics)",
+        help="Root directory of validated sequences (default: training_data/batch0/validated_simPhysics)",
     )
 
     # Mutually exclusive execution modes
@@ -841,6 +1143,24 @@ def parse_args() -> argparse.Namespace:
         metavar="METRES",
         help=f"Hover height above pick/place poses in metres (default: {DEFAULT_HOVER_Z})",
     )
+    p.add_argument(
+        "--export-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "After a fully successful sim/dry-run, export all planned trajectories "
+            "to DIR/planned_sequence.json for later replay without replanning."
+        ),
+    )
+    p.add_argument(
+        "--replay",
+        default=None,
+        metavar="JSON_FILE",
+        help=(
+            "Skip MoveIt planning entirely and execute a pre-planned sequence "
+            "from a JSON file produced by --export-dir."
+        ),
+    )
     return p.parse_args()
 
 
@@ -865,9 +1185,6 @@ def main() -> None:
     else:
         mode = MODE_DRY_RUN
 
-    # -- Load demo sequence -------------------------------------------------
-    demo_poses = load_demo_sequence(args.demo, args.data_dir)
-
     # -- ROS 2 / MoveIt setup -----------------------------------------------
     node = None
     if HAVE_ROS2:
@@ -875,11 +1192,6 @@ def main() -> None:
         node = PlanAndExecuteClient()
         print("[construct] PlanAndExecuteClient ready.")
         print(f"[construct] Mode: {mode}")
-
-        # In non-sim modes, clear any leftover MoveIt collision objects.
-        # (In sim mode _gz_clean_scene() handles this inside run_construction.)
-        if mode != MODE_SIM:
-            node.remove_all_world_collision_objects()
     else:
         print(
             "[construct] ROS 2 not available -- running in offline/print-only mode.\n"
@@ -888,7 +1200,27 @@ def main() -> None:
         )
         mode = MODE_DRY_RUN  # force dry-run if no ROS
 
-    # -- Run construction ---------------------------------------------------
+    # -- Replay mode: load JSON and execute without replanning ---------------
+    if args.replay:
+        try:
+            run_replay(node, args.replay, mode=mode)
+        finally:
+            if node is not None:
+                for _ in range(60):
+                    rclpy.spin_once(node, timeout_sec=0.05)
+                node.destroy_node()
+                rclpy.shutdown()
+                print("[construct] ROS 2 shutdown complete.")
+        return
+
+    # -- Planning mode: load demo sequence and plan --------------------------
+    demo_poses = load_demo_sequence(args.demo, args.data_dir)
+
+    # In non-sim modes, clear any leftover MoveIt collision objects.
+    # (In sim mode _gz_clean_scene() handles this inside run_construction.)
+    if node is not None and mode != MODE_SIM:
+        node.remove_all_world_collision_objects()
+
     try:
         run_construction(
             node,
@@ -898,6 +1230,7 @@ def main() -> None:
             hover_z=args.hover_z,
             mode=mode,
             forced_grasp=args.grasp_id,
+            export_dir=args.export_dir,
         )
     finally:
         if node is not None:

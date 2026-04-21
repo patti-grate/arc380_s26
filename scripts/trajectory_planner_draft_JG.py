@@ -15,7 +15,7 @@ from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from moveit_msgs.srv import GetMotionPlan, GetPlanningScene
+from moveit_msgs.srv import GetMotionPlan, GetPlanningScene, GetPositionIK
 from moveit_msgs.action import ExecuteTrajectory
 from moveit_msgs.msg import (
     MotionPlanRequest,
@@ -67,6 +67,7 @@ class PlanAndExecuteClient(Node):
         self._get_planning_scene_cli = self.create_client(
             GetPlanningScene, "/get_planning_scene"
         )
+        self._ik_cli = self.create_client(GetPositionIK, "/compute_ik")
 
         # abb_irb120_gazebo simulation_reset_node (gz_moveit.launch.py)
         self._reset_simulation_cli = self.create_client(Trigger, "/reset_simulation")
@@ -456,6 +457,67 @@ class PlanAndExecuteClient(Node):
                 self.get_logger().info(f"  {n}: {p:.6f}")
         return traj
 
+    def check_ik(
+        self,
+        group_name: str,
+        link_name: str,
+        frame_id: str,
+        target_xyz: tuple[float, float, float],
+        target_quat_xyzw: tuple[float, float, float, float],
+        start_joint_names: list[str] | None = None,
+        start_joint_positions: list[float] | None = None,
+        timeout_sec: float = 0.3,
+        avoid_collisions: bool = False,
+    ) -> bool:
+        """
+        Fast IK feasibility check via /compute_ik (~10 ms).
+        Collision-free is False by default: we only verify that a joint
+        solution exists for the Cartesian pose.  Collision safety along the
+        full path is OMPL's job; a collision-aware endpoint check false-rejects
+        valid placements that are tight against placed bricks.
+        Returns True if a valid IK solution exists; falls back to True if the
+        service is unavailable so OMPL remains the gate.
+        """
+        from moveit_msgs.msg import PositionIKRequest
+
+        if not self._ik_cli.wait_for_service(timeout_sec=0.5):
+            return True  # service not up -- let OMPL decide
+
+        ikr = PositionIKRequest()
+        ikr.group_name = group_name
+        ikr.ik_link_name = link_name
+        ikr.avoid_collisions = avoid_collisions
+
+        ps = PoseStamped()
+        ps.header.frame_id = frame_id
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = float(target_xyz[0])
+        ps.pose.position.y = float(target_xyz[1])
+        ps.pose.position.z = float(target_xyz[2])
+        qx, qy, qz, qw = target_quat_xyzw
+        ps.pose.orientation.x = float(qx)
+        ps.pose.orientation.y = float(qy)
+        ps.pose.orientation.z = float(qz)
+        ps.pose.orientation.w = float(qw)
+        ikr.pose_stamped = ps
+
+        if start_joint_names and start_joint_positions:
+            ikr.robot_state = self._make_start_state(
+                start_joint_names, start_joint_positions
+            )
+
+        ikr.timeout.nanosec = int(timeout_sec * 1e9)
+
+        req = GetPositionIK.Request()
+        req.ik_request = ikr
+
+        fut = self._ik_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=timeout_sec + 0.5)
+
+        if fut.result() is None:
+            return True  # timeout -- optimistically pass through
+        return fut.result().error_code.val == 1  # SUCCESS == 1
+
     def plan_arm_to_pose_constraints(
         self,
         group_name: str,
@@ -475,6 +537,7 @@ class PlanAndExecuteClient(Node):
         joint_4_constraints: float | None = None,
         joint_6_constraints: float | None = None,
         lock_wrist_to_start: bool = False,
+        lock_wrist_tolerance: float = 0.4,
     ) -> Optional[RobotTrajectory]:
         mpr = MotionPlanRequest()
         mpr.group_name = group_name
@@ -516,7 +579,7 @@ class PlanAndExecuteClient(Node):
                 mpr.path_constraints = Constraints()
                 path_c = mpr.path_constraints
             
-            for jname in ["joint_4", "joint_5", "joint_6"]:
+            for jname in ["joint_4", "joint_6"]:
                 if jname in start_joint_names:
                     idx = start_joint_names.index(jname)
                     pos = start_joint_positions[idx]
@@ -524,8 +587,8 @@ class PlanAndExecuteClient(Node):
                         self._make_joint_constraint(
                             joint_name=jname,
                             position=pos,
-                            tolerance_above=0.4,
-                            tolerance_below=0.4,
+                            tolerance_above=lock_wrist_tolerance,
+                            tolerance_below=lock_wrist_tolerance,
                         )
                     )
 
@@ -753,25 +816,6 @@ class PlanAndExecuteClient(Node):
             f"stalled={result.result.stalled}, reached_goal={result.result.reached_goal}"
         )
         return True
-
-def grip(state,node):
-    # TODO: gripper activate. and throw false if it cant?
-    gripper_open = 0.0
-    gripper_closed = 0.01
-    if state:
-        # TODO grip
-        node.send_gripper_command(
-        position=gripper_closed,
-        max_velocity=0.05,
-    ) 
-    else:
-        # TODO ungrip 
-        node.send_gripper_command(
-        position=gripper_open,
-        max_velocity=0.05,
-    ) 
-
-    return True
 
 # Some helper functions!!!!!!
 

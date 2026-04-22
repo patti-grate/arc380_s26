@@ -22,7 +22,7 @@ import numpy as np
 import cv2
 from cv2 import aruco
 from matplotlib import pyplot as plt
-
+import glob
 
 # # Load the predefined dictionary where our markers are printed from
 dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_250)
@@ -32,6 +32,69 @@ detector_params = aruco.DetectorParameters()
 
 # Create an ArucoDetector using the dictionary and detector parameters
 detector = aruco.ArucoDetector(dictionary, detector_params)
+
+#camera calib rq
+# termination criteria
+criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+ 
+# prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
+objp = np.zeros((9*6,3), np.float32)
+objp[:,:2] = np.mgrid[0:9,0:6].T.reshape(-1,2)
+ 
+# Arrays to store object points and image points from all the images.
+objpoints = [] # 3d point in real world space
+imgpoints = [] # 2d points in image plane.
+ 
+#images = glob.glob('arc380_s26/snapshot_testing/calib.jpg') #fix the implementation of this
+
+#relative imports for some reason didn't work for me.. . . 
+#this needs to be a picture of the printed checkerboard for calibration
+fname = "/Users/gratepatti/dev/arcgroup5/arc380_s26/scripts/calib.jpg"
+img = cv2.imread(fname)
+
+# h, w, _ = img.shape
+
+# width=1000
+# height = int(width*(h/w))
+# frame = cv.resize(img, (width, height), interpolation=cv.INTER_CUBIC)
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+cv2.imshow('calib', gray)
+
+# Find the chess board corners
+ret, corners = cv2.findChessboardCorners(gray, (9,6), None)
+
+mtx = []
+dist = []
+rvecs = []
+tvecs = []
+# If found, add object points, image points (after refining them)
+if ret == True:
+    objpoints.append(objp)
+
+    corners2 = cv2.cornerSubPix(gray,corners, (11,11), (-1,-1), criteria)
+    imgpoints.append(corners2)
+
+    # Draw and display the corners
+    cv2.drawChessboardCorners(img, (9,6), corners2, ret)
+    # cv.imshow('img', img)
+    # cv.waitKey(0)
+    # cv.destroyAllWindows() 
+    # img_path = "drawnmarkers.png"   
+    # cv.imwrite(img_path, img)
+    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
+    print(ret, mtx, dist, rvecs, tvecs)
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q"):
+        cv2.destroyAllWindows()
+
+else:
+    print('calibration did not work')
+
+cv2.destroyAllWindows()
+
+print(ret, mtx, dist, rvecs, tvecs)
 
 #load the webcam image
 video = cv2.VideoCapture(1)
@@ -63,6 +126,9 @@ def aruco_display(corners, ids, rejected, image):
 			cX = int((topLeft[0] + bottomRight[0]) / 2.0)
 			cY = int((topLeft[1] + bottomRight[1]) / 2.0)
 			cv2.circle(image, (cX, cY), 4, (0, 0, 255), -1)
+
+			cv2.circle(image, (int(cX * (4/3)), int(cY * (7/8))), 4, (0, 255, 0), -1)
+			
 			# draw the ArUco marker ID on the image
 			cv2.putText(image, str(markerID),(topLeft[0], topLeft[1] - 10), cv2.FONT_HERSHEY_SIMPLEX,
 				0.5, (0, 255, 0), 2)
@@ -75,6 +141,7 @@ def aruco_display(corners, ids, rejected, image):
 			# show the output image
 	return image
 
+#from Christoph Rackwitz, it used to be in the aruco library but not anymore
 def estimatePoseSingleMarkers(corners, marker_size, mtx, distortion):
     '''
     This will estimate the rvec and tvec for each of the marker corners detected by:
@@ -98,6 +165,9 @@ def estimatePoseSingleMarkers(corners, marker_size, mtx, distortion):
         tvecs.append(t)
         trash.append(nada)
     return rvecs, tvecs, trash
+
+rvec = []
+tvec = []
 
 #ret, frame = video.read()
 while True:
@@ -124,10 +194,31 @@ while True:
 	detected_markers = aruco_display(corners, ids, rejected, frame)
 	if len(corners) > 0:
 		for i in range(0, len(ids)):
-			# Estimate pose of each marker and return the values rvec and tvec---(different from those of camera coefficients)
-			# rvec, tvec, markerPoints = estimatePoseSingleMarkers(corners[i], 0.02)
-			# print(rvec, tvec)
-			print(i)
+			#Estimate pose of each marker and return the values rvec and tvec---(different from those of camera coefficients)
+			rvec, tvec, markerPoints = estimatePoseSingleMarkers(corners[i], 0.02, mtx, dist)
+			rvec = np.array(rvec)
+			tvec = np.array(tvec)
+
+			x_center = (corners[0][0] - corners[0][1]) / 2 + corners[0][0]
+			y_center = (corners[0][0] - corners[1][0]) / 2 + corners[0][0]
+
+			
+			#now store this info as a quaternion /// pose, stored as meters  
+			#MISSING: implementation of edge detection of the block, choosing the center of
+			#the block and then choosing the center point at the block's center 
+			# right now, the x&y axes can be infinitely rotateable
+
+			#condition that it is scanning one side over the other, compute the new x_center
+
+			# quaternion with block ID
+			w_id = [ids[i], x_center, y_center, 0, rvec, tvec] 
+			
+			#print('rvec type = ' + str(type(rvec)) + ' tvec type = ' + str(type(tvec)))
+			print(w_id)
+
+			cv2.drawFrameAxes(detected_markers, mtx, dist, rvec, tvec, width *1.5, 2)
+
+			
 	cv2.imshow("Image", detected_markers)
 
 	
@@ -169,33 +260,17 @@ if ret:
 	lengthofsidearuco = corners[0][0] - corners[1][1]
 	zedmarker = (widarucoin * ppi)/lengthofsidearuco
 
-	x_center = (corners[0][0] - corners[0][1] / 2) + corners[0][0]
-	y_center = (corners[0][0] - corners[1][0] / 2) + corners[0][0]
+	x_center = (corners[0][0] - corners[0][1]) / 2 + corners[0][0]
+	y_center = (corners[0][0] - corners[1][0]) / 2 + corners[0][0]
 
+	
 	#now store this info as a quaternion /// pose, stored as meters  
-	w = [x_center, y_center, zedmarker] 
+	w = [x_center, y_center, zedmarker, rvec, tvec] 
 	
 	cv2.destroyWindow("Captured")   
 		
 else:
 	print("Failed to capture image.")
-
-
-
-
-# img_path = 'raw_image.png'
-# img = cv2.imread(img_path)
-
-# # plt.imshow(img)
-# # plt.title('Loaded raw image')
-# # plt.show()
-# 
-
-
-
-
-
-
 
 
 dst_pts = np.array([[0, 0], [0, height*ppi], [width*ppi, height*ppi], [width*ppi, 0]], dtype='float32')

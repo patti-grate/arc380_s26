@@ -1,11 +1,13 @@
 import time
 from typing import Optional
 
+import numpy as np
 import rclpy
 from example_interfaces.srv import SetBool
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.msg import (
     BoundingVolume,
+    CollisionObject,
     Constraints,
     JointConstraint,
     MotionPlanRequest,
@@ -18,10 +20,18 @@ from moveit_msgs.srv import GetMotionPlan
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 
 from abb_egm_interfaces.action import ExecuteTrajectory
+
+_COLLISION_OBJECT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+)
 
 
 class EGMClient(Node):
@@ -39,6 +49,11 @@ class EGMClient(Node):
         self.execute_traj_ac = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
 
         self.gripper_client = self.create_client(SetBool, "/egm_controller/control/set_gripper")
+
+        # MoveIt planning scene publisher (used to register collision objects)
+        self._collision_object_pub = self.create_publisher(
+            CollisionObject, "/collision_object", _COLLISION_OBJECT_QOS
+        )
 
     @staticmethod
     def _make_start_state(joint_names, joint_positions) -> RobotState:
@@ -256,6 +271,59 @@ class EGMClient(Node):
 
         return self._call_motion_plan(mpr)
 
+    @property
+    def tcp_link(self) -> str:
+        return "gripper_tcp_calibrated"
+
+    def publish_scene_box(
+        self,
+        object_id: str,
+        frame_id: str,
+        size_xyz: tuple,
+        position_xyz: tuple,
+        quat_xyzw: tuple = (0.0, 0.0, 0.0, 1.0),
+    ) -> None:
+        co = CollisionObject()
+        co.header.frame_id = frame_id
+        co.id = object_id
+
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [float(size_xyz[0]), float(size_xyz[1]), float(size_xyz[2])]
+
+        pos = np.asarray(position_xyz, dtype=float).ravel()
+        q = np.asarray(quat_xyzw, dtype=float).ravel()
+
+        co.pose.position.x = float(pos[0])
+        co.pose.position.y = float(pos[1])
+        co.pose.position.z = float(pos[2])
+        co.pose.orientation.x = float(q[0])
+        co.pose.orientation.y = float(q[1])
+        co.pose.orientation.z = float(q[2])
+        co.pose.orientation.w = float(q[3])
+
+        prim_pose = Pose()
+        prim_pose.orientation.w = 1.0
+        co.primitives = [box]
+        co.primitive_poses = [prim_pose]
+        co.operation = CollisionObject.ADD
+
+        for _ in range(300):
+            if self._collision_object_pub.get_subscription_count() > 0:
+                break
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        for _ in range(25):
+            co.header.stamp = self.get_clock().now().to_msg()
+            self._collision_object_pub.publish(co)
+            for _ in range(3):
+                rclpy.spin_once(self, timeout_sec=0.02)
+            time.sleep(0.04)
+
+    def replay_arm_trajectory(self, robot_traj: RobotTrajectory) -> bool:
+        """Replay a pre-planned RobotTrajectory via EGM (same path as live execution)."""
+        return self.execute_moveit_trajectory(robot_traj)
+
     def execute_moveit_trajectory(self, traj: RobotTrajectory) -> bool:
 
         if not self.execute_traj_ac.wait_for_server(timeout_sec=5.0):
@@ -277,7 +345,14 @@ class EGMClient(Node):
         self.get_logger().info("EGM execution goal accepted.")
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=120.0)
+        if not result_future.done():
+            self.get_logger().error(
+                "EGM execution timed out after 120s. "
+                "Ensure the robot RAPID program has activated the EGM motion segment."
+            )
+            goal_handle.cancel_goal_async()
+            return False
         result = result_future.result()
 
         if result is None:

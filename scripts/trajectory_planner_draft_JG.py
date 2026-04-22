@@ -16,7 +16,7 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from moveit_msgs.srv import GetMotionPlan, GetPlanningScene, GetPositionIK
-from moveit_msgs.action import ExecuteTrajectory
+from moveit_msgs.action import ExecuteTrajectory as MoveItExecuteTrajectory
 from moveit_msgs.msg import (
     MotionPlanRequest,
     Constraints,
@@ -34,7 +34,15 @@ from moveit_msgs.msg import (
 from shape_msgs.msg import SolidPrimitive
 from geometry_msgs.msg import Pose, PoseStamped
 from control_msgs.action import FollowJointTrajectory, ParallelGripperCommand
+from example_interfaces.srv import SetBool
 from std_srvs.srv import Trigger
+
+try:
+    from abb_egm_interfaces.action import ExecuteTrajectory as EgmExecuteTrajectory
+    _HAVE_EGM = True
+except ImportError:
+    EgmExecuteTrajectory = None
+    _HAVE_EGM = False
 
 # MoveIt's planning scene subscriber often uses transient-local durability; matching
 # avoids silent QoS mismatch and helps late-joining publishers.
@@ -55,10 +63,11 @@ class PlanAndExecuteClient(Node):
       - direct controller execution for arm/gripper
     """
 
-    def __init__(self):
+    def __init__(self, mode: str = "sim"):
         super().__init__("trajectory_planner_draft")
+        self._mode = mode
 
-        # MoveIt planning service
+        # MoveIt planning service (used in all modes)
         self.plan_cli = self.create_client(GetMotionPlan, "/plan_kinematic_path")
         while not self.plan_cli.wait_for_service(timeout_sec=2.0):
             self.get_logger().info("Waiting for /plan_kinematic_path service...")
@@ -69,25 +78,42 @@ class PlanAndExecuteClient(Node):
         )
         self._ik_cli = self.create_client(GetPositionIK, "/compute_ik")
 
-        # abb_irb120_gazebo simulation_reset_node (gz_moveit.launch.py)
-        self._reset_simulation_cli = self.create_client(Trigger, "/reset_simulation")
-
-        # MoveIt execution action
-        self.execute_moveit_ac = ActionClient(
-            self, ExecuteTrajectory, "/execute_trajectory"
-        )
-
-        # ros2_control trajectory actions
-        self.arm_traj_ac = ActionClient(
-            self,
-            FollowJointTrajectory,
-            "/arm_controller/follow_joint_trajectory",
-        )
-        self.gripper_cmd_ac = ActionClient(
-            self,
-            ParallelGripperCommand,
-            "/gripper_controller/gripper_cmd",
-        )
+        if mode == "real":
+            # Real robot: execute via EGM controller directly, gripper via SetBool service.
+            if not _HAVE_EGM:
+                raise RuntimeError(
+                    "abb_egm_interfaces is not installed; cannot run in real mode."
+                )
+            self._egm_execute_ac = ActionClient(
+                self, EgmExecuteTrajectory, "/execute_trajectory"
+            )
+            self._egm_gripper_cli = self.create_client(
+                SetBool, "/egm_controller/control/set_gripper"
+            )
+            # Not used in real mode but set to None so attribute exists
+            self.execute_moveit_ac = None
+            self.arm_traj_ac = None
+            self.gripper_cmd_ac = None
+            self._reset_simulation_cli = None
+        else:
+            # Sim / dry-run: MoveIt execute action + ros2_control action clients.
+            self._egm_execute_ac = None
+            self._egm_gripper_cli = None
+            self.execute_moveit_ac = ActionClient(
+                self, MoveItExecuteTrajectory, "/execute_trajectory"
+            )
+            self.arm_traj_ac = ActionClient(
+                self,
+                FollowJointTrajectory,
+                "/arm_controller/follow_joint_trajectory",
+            )
+            self.gripper_cmd_ac = ActionClient(
+                self,
+                ParallelGripperCommand,
+                "/gripper_controller/gripper_cmd",
+            )
+            # abb_irb120_gazebo simulation reset (gz_moveit.launch.py only)
+            self._reset_simulation_cli = self.create_client(Trigger, "/reset_simulation")
 
         # MoveIt planning_scene_monitor subscribes here (default name; check with
         # `ros2 topic list | grep collision` if your launch uses a namespace).
@@ -97,6 +123,12 @@ class PlanAndExecuteClient(Node):
         self._attached_object_pub = self.create_publisher(
             AttachedCollisionObject, "/attached_collision_object", _COLLISION_OBJECT_QOS
         )
+
+    @property
+    def tcp_link(self) -> str:
+        """TCP link name used for MoveIt planning goals.
+        Real robot uses the calibrated frame; sim uses the nominal frame."""
+        return "gripper_tcp_calibrated" if self._mode == "real" else "gripper_tcp"
 
     def attach_box_to_gripper(
         self,
@@ -466,7 +498,7 @@ class PlanAndExecuteClient(Node):
         target_quat_xyzw: tuple[float, float, float, float],
         start_joint_names: list[str] | None = None,
         start_joint_positions: list[float] | None = None,
-        timeout_sec: float = 0.3,
+        timeout_sec: float = 0.5,
         avoid_collisions: bool = False,
     ) -> bool:
         """
@@ -501,10 +533,19 @@ class PlanAndExecuteClient(Node):
         ps.pose.orientation.w = float(qw)
         ikr.pose_stamped = ps
 
+        # Seed: use caller-provided state when given; otherwise use the zero
+        # configuration.  Using the current robot state as the seed biases the
+        # KDL iterative solver toward the current arm pose, which can cause it
+        # to fail when the target is on the far side of the workspace (e.g.
+        # supply at negative-Y while SAFE_HOME points in a different direction).
+        # The zero config is neutral and gives more consistent convergence.
         if start_joint_names and start_joint_positions:
             ikr.robot_state = self._make_start_state(
                 start_joint_names, start_joint_positions
             )
+        else:
+            zero_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+            ikr.robot_state = self._make_start_state(zero_names, [0.0] * 6)
 
         ikr.timeout.nanosec = int(timeout_sec * 1e9)
 
@@ -562,13 +603,15 @@ class PlanAndExecuteClient(Node):
                     )
                 )
             if joint_6_constraints is not None:
-                w6 = float(joint_6_constraints)
+                # Constrain j6 to [0, 2π] (centre=π, half-width=π).
+                # This prevents OMPL from choosing the negative-angle winding
+                # that produces >180° wrist spins between planning phases.
                 path_c.joint_constraints.append(
                     self._make_joint_constraint(
                         joint_name="joint_6",
-                        position=0.0,
-                        tolerance_above=w6,
-                        tolerance_below=w6,
+                        position=np.pi,
+                        tolerance_above=np.pi,
+                        tolerance_below=np.pi,
                     )
                 )
             mpr.path_constraints = path_c
@@ -673,16 +716,21 @@ class PlanAndExecuteClient(Node):
         return self._call_motion_plan(mpr)
 
     def execute_moveit_trajectory(self, traj: RobotTrajectory) -> bool:
+        """Execute a planned RobotTrajectory.
+
+        Sim mode  → MoveIt /execute_trajectory (moveit_msgs, full RobotTrajectory).
+        Real mode → EGM    /execute_trajectory (abb_egm_interfaces, JointTrajectory).
         """
-        Executes a RobotTrajectory through MoveIt's /execute_trajectory action.
-        This is the simplest path when MoveIt is already configured with both
-        arm_controller and gripper_controller.
-        """
+        if self._mode == "real":
+            return self._egm_execute_trajectory(traj)
+        return self._moveit_execute_trajectory(traj)
+
+    def _moveit_execute_trajectory(self, traj: RobotTrajectory) -> bool:
         if not self.execute_moveit_ac.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("/execute_trajectory action not available.")
             return False
 
-        goal = ExecuteTrajectory.Goal()
+        goal = MoveItExecuteTrajectory.Goal()
         goal.trajectory = traj
 
         send_future = self.execute_moveit_ac.send_goal_async(goal)
@@ -711,6 +759,49 @@ class PlanAndExecuteClient(Node):
             return False
 
         self.get_logger().info("MoveIt execution succeeded.")
+        return True
+
+    def _egm_execute_trajectory(self, traj: RobotTrajectory) -> bool:
+        if not self._egm_execute_ac.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("EGM /execute_trajectory action not available.")
+            return False
+
+        goal = EgmExecuteTrajectory.Goal()
+        goal.trajectory = traj.joint_trajectory
+        goal.stop_active_motion = True
+
+        send_future = self._egm_execute_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future)
+        goal_handle = send_future.result()
+
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error("EGM execution goal rejected.")
+            return False
+
+        self.get_logger().info("EGM execution goal accepted.")
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=120.0)
+        if not result_future.done():
+            self.get_logger().error(
+                "EGM execution timed out after 120s. "
+                "Ensure the robot RAPID program has activated the EGM motion segment."
+            )
+            goal_handle.cancel_goal_async()
+            return False
+        result = result_future.result()
+
+        if result is None:
+            self.get_logger().error("Failed to get EGM execution result.")
+            return False
+
+        if not result.result.success:
+            self.get_logger().error(
+                f"EGM execution failed: {result.result.message}"
+            )
+            return False
+
+        self.get_logger().info("EGM execution succeeded.")
         return True
 
     def _send_follow_joint_trajectory(
@@ -774,12 +865,98 @@ class PlanAndExecuteClient(Node):
             self.arm_traj_ac, joint_names, positions, duration_sec
         )
 
+    def replay_arm_trajectory(self, robot_traj: "RobotTrajectory") -> bool:
+        """Send a pre-planned RobotTrajectory directly to the arm controller.
+
+        Sim  → FollowJointTrajectory (bypasses MoveIt start-state validation).
+        Real → EGM ExecuteTrajectory (same path as live execution).
+        """
+        if self._mode == "real":
+            return self._egm_execute_trajectory(robot_traj)
+
+        jt = robot_traj.joint_trajectory
+        if not jt.points:
+            self.get_logger().error("replay_arm_trajectory: empty trajectory")
+            return False
+
+        if not self.arm_traj_ac.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("FollowJointTrajectory action server not available.")
+            return False
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = jt
+
+        send_future = self.arm_traj_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_future)
+        goal_handle = send_future.result()
+
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error("replay_arm_trajectory: goal rejected by controller.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        result = result_future.result()
+
+        if result is None:
+            self.get_logger().error("replay_arm_trajectory: no result from controller.")
+            return False
+
+        if result.result.error_code != 0:
+            self.get_logger().error(
+                f"replay_arm_trajectory: controller error_code={result.result.error_code}"
+            )
+            return False
+
+        self.get_logger().info("replay_arm_trajectory: succeeded.")
+        return True
+
     def send_gripper_command(
         self,
         position: float,
         max_velocity: float = 0.02,
         max_effort: float = 0.0,
         joint_name: str = "left_finger_joint",
+    ) -> bool:
+        """Open (position≈0) or close (position>0) the gripper.
+
+        Sim  → ParallelGripperCommand action (ros2_control).
+        Real → SetBool service at /egm_controller/control/set_gripper
+               (True = close, False = open).
+        """
+        if self._mode == "real":
+            return self._egm_send_gripper(position)
+        return self._sim_send_gripper(position, max_velocity, max_effort, joint_name)
+
+    def _egm_send_gripper(self, position: float) -> bool:
+        if not self._egm_gripper_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("/egm_controller/control/set_gripper service not available.")
+            return False
+
+        req = SetBool.Request()
+        req.data = position > 1e-6  # True = close, False = open
+
+        fut = self._egm_gripper_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
+
+        if fut.result() is None:
+            self.get_logger().error("EGM gripper service call timed out.")
+            return False
+
+        if not fut.result().success:
+            self.get_logger().error(f"EGM gripper command failed: {fut.result().message}")
+            return False
+
+        action = "closed" if position > 1e-6 else "opened"
+        self.get_logger().info(f"EGM gripper {action}.")
+        return True
+
+    def _sim_send_gripper(
+        self,
+        position: float,
+        max_velocity: float,
+        max_effort: float,
+        joint_name: str,
     ) -> bool:
         if not self.gripper_cmd_ac.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("ParallelGripperCommand action server not available.")
@@ -835,7 +1012,7 @@ def move(position, quaternion, node):
     
     arm_traj = node.plan_arm_to_pose_constraints(
         group_name="arm",
-        link_name="gripper_tcp",
+        link_name=node.tcp_link,
         frame_id="world",
         goal_xyz=tuple(position),
         goal_quat_xyzw=tuple(quaternion),

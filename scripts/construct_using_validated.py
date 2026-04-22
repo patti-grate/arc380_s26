@@ -71,6 +71,8 @@ try:
     # Import the planner client from the sibling script
     sys.path.insert(0, os.path.dirname(__file__))
     from trajectory_planner_draft_JG import PlanAndExecuteClient
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "examples"))
+    from egm_example import EGMClient
 
     HAVE_ROS2 = True
 except ImportError:
@@ -165,7 +167,7 @@ T_GRASP_OFFSETS: dict[str, np.ndarray] = {
 GRASP_ORDER: list[str] = ["grasp1", "grasp2", "grasp3", "grasp4"]
 
 # Default supply pallet pose -- x, y, z (flat brick, no rotation for now)
-DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (0.0, 0.48, 0.030)
+DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, -0.40, 0.025)
 DEFAULT_SUPPLY_QUAT_XYZW: tuple[float, float, float, float] = (
     0.0,
     0.0,
@@ -179,7 +181,7 @@ DEFAULT_HOVER_Z: float = 0.12
 # Safe home joint configuration -- elevated slightly above table to avoid
 # MoveIt goal-state collision rejection at the Gazebo spawn frame.
 SAFE_HOME_NAMES: list[str] = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-SAFE_HOME_POSITIONS: list[float] = [1.57, 0.30, -0.18, 0.0, 0.94, -1.57]
+SAFE_HOME_POSITIONS: list[float] = [-1.57, 0.00, 0.00, 0.00, 0.00, -1.57]
 
 # Gazebo SDF path for bricks (used in --sim mode for visual spawning)
 _SDF_PATH = os.path.normpath(
@@ -553,10 +555,10 @@ def plan_brick_sequence(
     # Fast IK pre-check: reject geometrically infeasible poses in ~10 ms
     # before spending up to 6 s on OMPL per phase.
     # ------------------------------------------------------------------
-    if not node.check_ik("arm", "gripper_tcp", "world", supply_tcp_xyz, supply_tcp_quat):
+    if not node.check_ik("arm", node.tcp_link, "world", supply_tcp_xyz, supply_tcp_quat):
         log_info(f"    [IK SKIP] Supply TCP infeasible for {grasp_id}")
         return None
-    if not node.check_ik("arm", "gripper_tcp", "world", goal_tcp_xyz, goal_tcp_quat):
+    if not node.check_ik("arm", node.tcp_link, "world", goal_tcp_xyz, goal_tcp_quat):
         log_info(f"    [IK SKIP] Goal TCP infeasible for {grasp_id}")
         return None
 
@@ -573,7 +575,7 @@ def plan_brick_sequence(
 
         traj = node.plan_arm_to_pose_constraints(
             group_name="arm",
-            link_name="gripper_tcp",
+            link_name=node.tcp_link,
             frame_id="world",
             goal_xyz=tuple(float(v) for v in xyz),
             goal_quat_xyzw=tuple(float(v) for v in quat),
@@ -983,6 +985,9 @@ def run_replay(
     planning at all.  Collision objects are still registered after each
     placement so MoveIt's execution monitor stays consistent.
     """
+    if mode == MODE_SIM:
+        _gz_clean_scene(node)
+
     with open(sequence_path) as f:
         data = json.load(f)
 
@@ -1001,8 +1006,9 @@ def run_replay(
             position_xyz=(0.0, 0.0, -0.02),
         )
 
-    # Move to SAFE_HOME first (needs one planning call to seed the controller)
-    if node is not None and not dry_run:
+    # Move to SAFE_HOME first (sim only — in real mode the operator positions the robot manually
+    # before running, and routing through EGM requires RAPID to be in the EGM motion segment)
+    if node is not None and not dry_run and mode != MODE_REAL:
         print("[replay] Homing to SAFE_HOME before replay...")
         init_traj = node.plan_gripper_to_joint_positions(
             group_name="arm",
@@ -1017,6 +1023,8 @@ def run_replay(
             node.send_gripper_command(position=0.011, max_velocity=0.05)
         else:
             print("[replay][WARN] SAFE_HOME init failed; first execution may reject.")
+    elif mode == MODE_REAL:
+        print("[replay] Real mode: skipping SAFE_HOME init — position robot manually before replay.")
 
     print(f"\n[replay] Starting replay -- mode={mode}\n")
 
@@ -1027,14 +1035,30 @@ def run_replay(
             f"grasp={brick_data['grasp_id']} ({brick_data['fallback_desc']}) --"
         )
 
+        gz_name = f"construct_brick_{brick_idx:03d}"
+        supply_7d = np.array(brick_data["supply_7d"])
+        gz_spawned = False
+
         for step in brick_data["steps"]:
             stype = step["type"]
             if stype == "traj":
+                label = step.get("label", "?")
+
+                # Spawn the Gazebo brick just before the arm descends to grasp,
+                # mirroring the timing used in execute_brick_sequence.
+                if label == "grasp_supply" and mode == MODE_SIM and not gz_spawned:
+                    _gz_spawn(gz_name, supply_7d)
+                    gz_spawned = True
+                    time.sleep(0.3)
+
                 if not dry_run and node is not None:
                     traj = _deserialize_traj(step)
-                    node.execute_moveit_trajectory(traj)
+                    print(f"    [replay] executing {label}")
+                    ok = node.replay_arm_trajectory(traj)
+                    if not ok:
+                        print(f"    [replay][WARN] {label} controller rejected — skipping")
                 else:
-                    print(f"    [dry] execute {step['label']}")
+                    print(f"    [dry] execute {label}")
             elif stype == "gripper":
                 if not dry_run and node is not None:
                     pos = 0.01 if step["action"] == "close" else 0.0
@@ -1148,17 +1172,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="DIR",
         help=(
-            "After a fully successful sim/dry-run, export all planned trajectories "
-            "to DIR/planned_sequence.json for later replay without replanning."
+            "Override the export directory for planned trajectories. "
+            "By default, successful sim/real runs auto-export to "
+            "<batch>/validated_simPhysics_robot/<demo>/planned_sequence.json."
         ),
+    )
+    p.add_argument(
+        "--no-export",
+        action="store_true",
+        default=False,
+        help="Disable the automatic export of planned trajectories after a successful run.",
     )
     p.add_argument(
         "--replay",
         default=None,
         metavar="JSON_FILE",
         help=(
-            "Skip MoveIt planning entirely and execute a pre-planned sequence "
-            "from a JSON file produced by --export-dir."
+            "Skip MoveIt planning entirely and execute a pre-planned sequence. "
+            "If given a demo name (e.g. 'demo_0') instead of a file path, "
+            "loads from <batch>/validated_simPhysics_robot/<demo>/planned_sequence.json."
         ),
     )
     return p.parse_args()
@@ -1189,8 +1221,12 @@ def main() -> None:
     node = None
     if HAVE_ROS2:
         rclpy.init()
-        node = PlanAndExecuteClient()
-        print("[construct] PlanAndExecuteClient ready.")
+        if mode == MODE_REAL:
+            node = EGMClient()  # type: ignore[name-defined]
+            print("[construct] EGMClient ready (real robot mode).")
+        else:
+            node = PlanAndExecuteClient(mode=mode)  # type: ignore[name-defined]
+            print("[construct] PlanAndExecuteClient ready.")
         print(f"[construct] Mode: {mode}")
     else:
         print(
@@ -1200,10 +1236,25 @@ def main() -> None:
         )
         mode = MODE_DRY_RUN  # force dry-run if no ROS
 
+    # -- Resolve the validated_simPhysics_robot sibling directory --------------
+    # Structure: <root>/<batch>/validated_simPhysics/<demo>  →
+    #            <root>/<batch>/validated_simPhysics_robot/<demo>
+    robot_dir = os.path.join(
+        os.path.dirname(os.path.abspath(args.data_dir)),
+        "validated_simPhysics_robot",
+    )
+
     # -- Replay mode: load JSON and execute without replanning ---------------
     if args.replay:
+        # Accept either an explicit file path or a bare demo name
+        replay_path = args.replay
+        if not os.path.isfile(replay_path):
+            replay_path = os.path.join(robot_dir, replay_path, "planned_sequence.json")
+        if not os.path.isfile(replay_path):
+            print(f"[replay] ERROR: sequence file not found: {replay_path}")
+            sys.exit(1)
         try:
-            run_replay(node, args.replay, mode=mode)
+            run_replay(node, replay_path, mode=mode)
         finally:
             if node is not None:
                 for _ in range(60):
@@ -1221,6 +1272,14 @@ def main() -> None:
     if node is not None and mode != MODE_SIM:
         node.remove_all_world_collision_objects()
 
+    # Resolve export directory: explicit override > auto-derived sibling > disabled
+    if args.no_export:
+        export_dir = None
+    elif args.export_dir:
+        export_dir = args.export_dir
+    else:
+        export_dir = os.path.join(robot_dir, args.demo)
+
     try:
         run_construction(
             node,
@@ -1230,7 +1289,7 @@ def main() -> None:
             hover_z=args.hover_z,
             mode=mode,
             forced_grasp=args.grasp_id,
-            export_dir=args.export_dir,
+            export_dir=export_dir,
         )
     finally:
         if node is not None:

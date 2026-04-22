@@ -62,9 +62,11 @@ RUN apt-get update && apt-get install -y \
 # ── rosdep init ───────────────────────────────────────────────────────────────
 RUN rosdep init && rosdep update
 
-RUN python3 -m pip install --no-cache-dir --break-system-packages "protobuf==6.31.1" "rhino3dm" "scipy"
 RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-installed \
+    "numpy" \
+    "scipy" \
     "protobuf==6.31.1" \
+    "rhino3dm" \
     "opencv-contrib-python-headless"
 
 

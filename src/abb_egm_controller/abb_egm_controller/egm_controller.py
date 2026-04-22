@@ -426,16 +426,15 @@ class EGMController(Node):
         if not initial_feedback:
             initial_feedback = [0.0] * len(robot_joint_names)
 
+        # Capture start_time before acquiring the lock so the EGM loop never sees
+        # start_time=0 (reset default) with valid points — that race would cause elapsed
+        # to equal system uptime and immediately trigger false done_event.
+        start_time = time.monotonic()
         with self._traj_lock:
-            self._traj_state.reset()  # TODO: instead of making this a state tracker, refactor into a trajectory executable, and each call instantiates a new instance
+            self._traj_state.reset()
             self._traj_state.points = list(trajectory.points)
             self._traj_state.joint_indices = joint_indices
             self._traj_state.start_positions = list(initial_feedback)
-
-        # Capture start_time as late as possible, immediately before starting execution,
-        # so that elapsed time in the EGM loop reflects actual robot motion time.
-        start_time = time.monotonic()
-        with self._traj_lock:
             self._traj_state.start_time = start_time
 
         self.state = ControllerState.TRAJECTORY

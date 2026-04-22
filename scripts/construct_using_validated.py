@@ -71,6 +71,7 @@ try:
     # Import the planner client from the sibling script
     sys.path.insert(0, os.path.dirname(__file__))
     from trajectory_planner_draft_JG import PlanAndExecuteClient
+
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "examples"))
     from egm_example import EGMClient
 
@@ -167,7 +168,7 @@ T_GRASP_OFFSETS: dict[str, np.ndarray] = {
 GRASP_ORDER: list[str] = ["grasp1", "grasp2", "grasp3", "grasp4"]
 
 # Default supply pallet pose -- x, y, z (flat brick, no rotation for now)
-DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, -0.40, 0.025)
+DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, -0.40, 0.030)
 DEFAULT_SUPPLY_QUAT_XYZW: tuple[float, float, float, float] = (
     0.0,
     0.0,
@@ -180,8 +181,15 @@ DEFAULT_HOVER_Z: float = 0.12
 
 # Safe home joint configuration -- elevated slightly above table to avoid
 # MoveIt goal-state collision rejection at the Gazebo spawn frame.
-SAFE_HOME_NAMES: list[str] = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-SAFE_HOME_POSITIONS: list[float] = [-1.57, 0.00, 0.00, 0.00, 0.00, -1.57]
+SAFE_HOME_NAMES: list[str] = [
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6",
+]
+SAFE_HOME_POSITIONS: list[float] = [-1.57, 0.00, 0.00, 0.00, 1.57, 1.57]
 
 # Gazebo SDF path for bricks (used in --sim mode for visual spawning)
 _SDF_PATH = os.path.normpath(
@@ -201,6 +209,18 @@ _WORLD_NAME = "irb120_workcell"
 MODE_DRY_RUN = "dry_run"  # plan only, no motion
 MODE_SIM = "sim"  # plan + execute in Gazebo simulation
 MODE_REAL = "real"  # plan + execute on real robot hardware
+
+# Real robot gripper is physically mounted +45° (π/4 rad) around the joint_6 axis
+# relative to the sim URDF model. Subtract this offset from all joint_6 positions
+# when replaying sim-planned trajectories on the real robot.
+REAL_GRIPPER_J6_OFFSET_RAD: float = -np.pi / 4
+
+# Real-mode Cartesian z corrections applied at PLANNING TIME.
+# These compensate for differences between sim and physical table/brick heights.
+# Physical supply bricks sit ~5 mm higher than sim (z=0.025 sim → z=0.030 real).
+REAL_SUPPLY_Z: float = 0.030
+# Lower goal placement by 2 mm so bricks seat flush on the real surface.
+REAL_GOAL_Z_OFFSET_M: float = -0.002
 
 
 # ===========================================================================
@@ -438,8 +458,13 @@ def hover_above(
 # ===========================================================================
 
 _PHASE_LABELS = [
-    "hover_supply", "grasp_supply", "lift_supply",
-    "hover_goal", "place_goal", "retract_goal", "return_home",
+    "hover_supply",
+    "grasp_supply",
+    "lift_supply",
+    "hover_goal",
+    "place_goal",
+    "retract_goal",
+    "return_home",
 ]
 
 
@@ -448,13 +473,15 @@ def _serialize_traj(traj) -> dict:
     jt = traj.joint_trajectory
     pts = []
     for p in jt.points:
-        pts.append({
-            "positions": list(p.positions),
-            "velocities": list(p.velocities),
-            "accelerations": list(p.accelerations),
-            "t_sec": p.time_from_start.sec,
-            "t_nanosec": p.time_from_start.nanosec,
-        })
+        pts.append(
+            {
+                "positions": list(p.positions),
+                "velocities": list(p.velocities),
+                "accelerations": list(p.accelerations),
+                "t_sec": p.time_from_start.sec,
+                "t_nanosec": p.time_from_start.nanosec,
+            }
+        )
     return {"joint_names": list(jt.joint_names), "points": pts}
 
 
@@ -481,8 +508,31 @@ def _deserialize_traj(data: dict):
     return rt
 
 
-def _build_brick_steps(plans: list, goal_7d: np.ndarray, supply_7d: np.ndarray,
-                       grasp_id: str, fallback_desc: str, brick_idx: int) -> dict:
+def _apply_j6_offset(traj, offset_rad: float):
+    """Shift joint_6 in every trajectory point by offset_rad.
+
+    Used to compensate for the real gripper being physically mounted at a
+    different angle than the URDF model. Modifies the trajectory in-place.
+    """
+    jt = traj.joint_trajectory
+    if "joint_6" not in jt.joint_names:
+        return traj
+    j6_idx = list(jt.joint_names).index("joint_6")
+    for pt in jt.points:
+        positions = list(pt.positions)
+        positions[j6_idx] += offset_rad
+        pt.positions = tuple(positions)
+    return traj
+
+
+def _build_brick_steps(
+    plans: list,
+    goal_7d: np.ndarray,
+    supply_7d: np.ndarray,
+    grasp_id: str,
+    fallback_desc: str,
+    brick_idx: int,
+) -> dict:
     """
     Package a brick's 7 planned trajectories + gripper commands into a
     JSON-serializable dict that _run_replay() can execute without replanning.
@@ -555,10 +605,26 @@ def plan_brick_sequence(
     # Fast IK pre-check: reject geometrically infeasible poses in ~10 ms
     # before spending up to 6 s on OMPL per phase.
     # ------------------------------------------------------------------
-    if not node.check_ik("arm", node.tcp_link, "world", supply_tcp_xyz, supply_tcp_quat):
+    if not node.check_ik(
+        "arm",
+        node.tcp_link,
+        "world",
+        supply_tcp_xyz,
+        supply_tcp_quat,
+        start_joint_names=SAFE_HOME_NAMES,
+        start_joint_positions=SAFE_HOME_POSITIONS,
+    ):
         log_info(f"    [IK SKIP] Supply TCP infeasible for {grasp_id}")
         return None
-    if not node.check_ik("arm", node.tcp_link, "world", goal_tcp_xyz, goal_tcp_quat):
+    if not node.check_ik(
+        "arm",
+        node.tcp_link,
+        "world",
+        goal_tcp_xyz,
+        goal_tcp_quat,
+        start_joint_names=SAFE_HOME_NAMES,
+        start_joint_positions=SAFE_HOME_POSITIONS,
+    ):
         log_info(f"    [IK SKIP] Goal TCP infeasible for {grasp_id}")
         return None
 
@@ -579,8 +645,9 @@ def plan_brick_sequence(
             frame_id="world",
             goal_xyz=tuple(float(v) for v in xyz),
             goal_quat_xyzw=tuple(float(v) for v in quat),
-            joint_4_constraints=3.14,  # ±π keeps IK workspace routing intact
-            joint_6_constraints=3.14,
+            joint_4_constraints=2.79,  # ±160 deg (physical limit)
+            joint_5_constraints=2.09,  # ±120 deg (physical limit)
+            joint_6_constraints=3.14,  # ±180 deg (keeps wrist within [0, 2pi])
             allowed_planning_time=6.0,
             num_attempts=5,
             start_joint_names=start_names,
@@ -653,13 +720,13 @@ def plan_brick_sequence(
 
     def _plan_return_home() -> bool:
         nonlocal current_start_state
-            
+
         start_names, start_positions = (
             current_start_state if current_start_state else (None, None)
         )
         t_names = SAFE_HOME_NAMES
         t_positions = SAFE_HOME_POSITIONS
-        
+
         traj = node.plan_gripper_to_joint_positions(
             group_name="arm",
             goal_joint_names=t_names,
@@ -673,7 +740,7 @@ def plan_brick_sequence(
         if traj is None:
             log_info(f"    [FAIL] Plan failed at return_home for {grasp_id}")
             return False
-            
+
         plans.append(traj)
         next_state = _extract_last_state(traj)
         if next_state:
@@ -818,7 +885,9 @@ def run_construction(
 
     # Ensure the robot is physically at the exact SAFE_HOME_POSITIONS before any plans run
     if node is not None and mode in [MODE_SIM, MODE_REAL]:
-        print("[construct] Physically aligning to SAFE_HOME to initialize geometric baseline...")
+        print(
+            "[construct] Physically aligning to SAFE_HOME to initialize geometric baseline..."
+        )
         init_traj = node.plan_gripper_to_joint_positions(
             group_name="arm",
             goal_joint_names=SAFE_HOME_NAMES,
@@ -834,12 +903,29 @@ def run_construction(
             # Make sure gripper is open initially
             node.send_gripper_command(position=0.011, max_velocity=0.05)
         else:
-            print("[WARN] Initialization move to SAFE_HOME failed. First trajectory might reject!")
+            print(
+                "[WARN] Initialization move to SAFE_HOME failed. First trajectory might reject!"
+            )
 
-    supply_7d_base = np.array([*supply_xyz, *supply_quat_xyzw])
+    # Override supply z for real mode: physical bricks sit higher than sim model.
+    effective_supply_xyz = supply_xyz
+    if mode == MODE_REAL and supply_xyz[2] != REAL_SUPPLY_Z:
+        effective_supply_xyz = (supply_xyz[0], supply_xyz[1], REAL_SUPPLY_Z)
+    supply_7d_base = np.array([*effective_supply_xyz, *supply_quat_xyzw])
+
+    if mode == MODE_REAL:
+        print(
+            f"[construct] Real-mode z corrections active: "
+            f"supply z={effective_supply_xyz[2]:.3f}m, goal z offset={REAL_GOAL_Z_OFFSET_M:+.3f}m"
+        )
 
     for brick_idx, original_goal_7d in enumerate(demo_poses):
         print(f"\n[construct] -- Brick {brick_idx + 1}/{len(demo_poses)} --")
+
+        # Apply real-robot z correction to the goal placement pose.
+        if mode == MODE_REAL and REAL_GOAL_Z_OFFSET_M != 0.0:
+            original_goal_7d = original_goal_7d.copy()
+            original_goal_7d[2] += REAL_GOAL_Z_OFFSET_M
 
         is_standing = is_standing_brick(original_goal_7d)
         if forced_grasp:
@@ -868,7 +954,21 @@ def run_construction(
                 break
 
             for grasp_id in active_grasps:
-                T_rel = T_GRASP_OFFSETS[grasp_id]
+                T_rel = T_GRASP_OFFSETS[grasp_id].copy()
+
+                if mode == MODE_REAL:
+                    # Physical gripper is installed 45 degrees CCW (+45 deg around Z).
+                    # Compensate by rotating the MoveIt target TCP frame 45 degrees CW (-45 deg).
+                    rad = np.radians(-45.0)
+                    Rz_correction = np.array(
+                        [
+                            [np.cos(rad), -np.sin(rad), 0.0, 0.0],
+                            [np.sin(rad), np.cos(rad), 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    )
+                    T_rel = T_rel @ Rz_correction
 
                 plans = plan_brick_sequence(
                     node,
@@ -919,8 +1019,12 @@ def run_construction(
         if export_dir is not None and all(p is not None for p in best_plans):
             export_sequence.append(
                 _build_brick_steps(
-                    best_plans, best_goal_7d, best_supply_7d,
-                    best_grasp_id, best_desc, brick_idx,
+                    best_plans,
+                    best_goal_7d,
+                    best_supply_7d,
+                    best_grasp_id,
+                    best_desc,
+                    brick_idx,
                 )
             )
 
@@ -1024,7 +1128,9 @@ def run_replay(
         else:
             print("[replay][WARN] SAFE_HOME init failed; first execution may reject.")
     elif mode == MODE_REAL:
-        print("[replay] Real mode: skipping SAFE_HOME init — position robot manually before replay.")
+        print(
+            "[replay] Real mode: skipping SAFE_HOME init — position robot manually before replay."
+        )
 
     print(f"\n[replay] Starting replay -- mode={mode}\n")
 
@@ -1053,10 +1159,14 @@ def run_replay(
 
                 if not dry_run and node is not None:
                     traj = _deserialize_traj(step)
+                    if mode == MODE_REAL:
+                        traj = _apply_j6_offset(traj, REAL_GRIPPER_J6_OFFSET_RAD)
                     print(f"    [replay] executing {label}")
                     ok = node.replay_arm_trajectory(traj)
                     if not ok:
-                        print(f"    [replay][WARN] {label} controller rejected — skipping")
+                        print(
+                            f"    [replay][WARN] {label} controller rejected — skipping"
+                        )
                 else:
                     print(f"    [dry] execute {label}")
             elif stype == "gripper":

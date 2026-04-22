@@ -575,7 +575,11 @@ class PlanAndExecuteClient(Node):
         max_velocity_scaling: float = 0.2,
         max_acceleration_scaling: float = 0.2,
         planner_id: str = "",
+        joint_1_constraints: float | None = None,
+        joint_2_constraints: float | None = None,
+        joint_3_constraints: float | None = None,
         joint_4_constraints: float | None = None,
+        joint_5_constraints: float | None = None,
         joint_6_constraints: float | None = None,
         lock_wrist_to_start: bool = False,
         lock_wrist_tolerance: float = 0.4,
@@ -590,28 +594,30 @@ class PlanAndExecuteClient(Node):
                 start_joint_names, start_joint_positions
             )
 
-        if joint_4_constraints is not None or joint_6_constraints is not None:
+        # Apply path constraints for specific joints if requested
+        joint_consts = {
+            "joint_1": joint_1_constraints,
+            "joint_2": joint_2_constraints,
+            "joint_3": joint_3_constraints,
+            "joint_4": joint_4_constraints,
+            "joint_5": joint_5_constraints,
+            "joint_6": joint_6_constraints,
+        }
+        
+        active_consts = {k: v for k, v in joint_consts.items() if v is not None}
+        if active_consts:
             path_c = Constraints()
-            if joint_4_constraints is not None:
-                w4 = float(joint_4_constraints)
+            for jname, val in active_consts.items():
+                # Center constraint at 0.0 for most joints; joint_6 uses pi to 
+                # keep it in the [0, 2pi] range as requested by the user.
+                # NOTE: construct_using_validated.py home pos was updated to 1.57.
+                target_pos = np.pi if jname == "joint_6" else 0.0
                 path_c.joint_constraints.append(
                     self._make_joint_constraint(
-                        joint_name="joint_4",
-                        position=0.0,
-                        tolerance_above=w4,
-                        tolerance_below=w4,
-                    )
-                )
-            if joint_6_constraints is not None:
-                # Constrain j6 to [0, 2π] (centre=π, half-width=π).
-                # This prevents OMPL from choosing the negative-angle winding
-                # that produces >180° wrist spins between planning phases.
-                path_c.joint_constraints.append(
-                    self._make_joint_constraint(
-                        joint_name="joint_6",
-                        position=np.pi,
-                        tolerance_above=np.pi,
-                        tolerance_below=np.pi,
+                        joint_name=jname,
+                        position=target_pos,
+                        tolerance_above=float(val),
+                        tolerance_below=float(val),
                     )
                 )
             mpr.path_constraints = path_c

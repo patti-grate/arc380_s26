@@ -39,5 +39,6 @@ services:
   ros2_real:
     <<: *ros2-common
     container_name: arc380_ros2_real
-    network_mode: host
+    ports:
+      - "6511:6511/udp"
     command: ros2 launch abb_egm_controller egm_controller.launch.py

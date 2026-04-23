@@ -1210,7 +1210,7 @@ def parse_args() -> argparse.Namespace:
             os.path.dirname(__file__),
             "..",
             "training_data",
-            "batch0",
+            "batch1",
             "validated_simPhysics",
         )
     )

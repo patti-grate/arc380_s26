@@ -52,8 +52,12 @@ gripper_controller:
       - position
       - velocity
     action_monitor_rate: 20.0
-    max_effort: 300.0
+    max_effort: 1000.0
     goal_tolerance: 0.001
     allow_stalling: true
     stall_velocity_threshold: 0.005
     stall_timeout: 1.0
+
+    gains:
+      left_finger_joint: {p: 20000.0, i: 1.0, d: 500.0}
+      right_finger_joint: {p: 20000.0, i: 1.0, d: 500.0}

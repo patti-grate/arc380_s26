@@ -15,7 +15,12 @@ from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from moveit_msgs.srv import GetMotionPlan, GetPlanningScene, GetPositionIK
+from moveit_msgs.srv import (
+    GetMotionPlan,
+    GetPlanningScene,
+    GetPositionIK,
+    GetCartesianPath,
+)
 from moveit_msgs.action import ExecuteTrajectory as MoveItExecuteTrajectory
 from moveit_msgs.msg import (
     MotionPlanRequest,
@@ -39,6 +44,7 @@ from std_srvs.srv import Trigger
 
 try:
     from abb_egm_interfaces.action import ExecuteTrajectory as EgmExecuteTrajectory
+
     _HAVE_EGM = True
 except ImportError:
     EgmExecuteTrajectory = None
@@ -63,12 +69,32 @@ class PlanAndExecuteClient(Node):
       - direct controller execution for arm/gripper
     """
 
-    def __init__(self, mode: str = "sim"):
+    def __init__(
+        self,
+        mode: str = "sim",
+        max_velocity_scaling: float = 0.2,
+        max_acceleration_scaling: float = 0.2,
+    ):
         super().__init__("trajectory_planner_draft")
         self._mode = mode
+        self._max_velocity_scaling = max_velocity_scaling
+        self._max_acceleration_scaling = max_acceleration_scaling
 
         # MoveIt planning service (used in all modes)
         self.plan_cli = self.create_client(GetMotionPlan, "/plan_kinematic_path")
+
+        # Gazebo services (sim mode only)
+        self.reset_cli = None
+        self.remove_cli = None
+        if mode == "sim":
+            from ros_gz_interfaces.srv import ControlWorld, DeleteEntity
+
+            self.reset_cli = self.create_client(
+                ControlWorld, "/world/irb120_workcell/control"
+            )
+            self.remove_cli = self.create_client(
+                DeleteEntity, "/world/irb120_workcell/remove"
+            )
         while not self.plan_cli.wait_for_service(timeout_sec=2.0):
             self.get_logger().info("Waiting for /plan_kinematic_path service...")
         self.get_logger().info("/plan_kinematic_path service available.")
@@ -77,6 +103,9 @@ class PlanAndExecuteClient(Node):
             GetPlanningScene, "/get_planning_scene"
         )
         self._ik_cli = self.create_client(GetPositionIK, "/compute_ik")
+        self._cartesian_cli = self.create_client(
+            GetCartesianPath, "/compute_cartesian_path"
+        )
 
         if mode == "real":
             # Real robot: execute via EGM controller directly, gripper via SetBool service.
@@ -113,7 +142,9 @@ class PlanAndExecuteClient(Node):
                 "/gripper_controller/gripper_cmd",
             )
             # abb_irb120_gazebo simulation reset (gz_moveit.launch.py only)
-            self._reset_simulation_cli = self.create_client(Trigger, "/reset_simulation")
+            self._reset_simulation_cli = self.create_client(
+                Trigger, "/reset_simulation"
+            )
 
         # MoveIt planning_scene_monitor subscribes here (default name; check with
         # `ros2 topic list | grep collision` if your launch uses a namespace).
@@ -135,7 +166,7 @@ class PlanAndExecuteClient(Node):
         object_id: str,
         size_xyz: tuple[float, float, float],
         link_name: str = "gripper_tcp",
-        touch_links: list[str] | None = None
+        touch_links: list[str] | None = None,
     ) -> None:
         """
         Attaches a generated collision box to the specified link (default: gripper_tcp).
@@ -158,12 +189,16 @@ class PlanAndExecuteClient(Node):
 
         aco.object.primitives = [box]
         aco.object.primitive_poses = [prim_pose]
-        
+
         if touch_links is None:
             # Let it ignore collisions with the gripper fingers
             aco.touch_links = [
-                "gripper_tcp", "link_6", "link_5", 
-                "gripper_base", "left_finger", "right_finger"
+                "gripper_tcp",
+                "link_6",
+                "link_5",
+                "gripper_base",
+                "left_finger",
+                "right_finger",
             ]
         else:
             aco.touch_links = touch_links
@@ -171,7 +206,7 @@ class PlanAndExecuteClient(Node):
         for _ in range(5):
             self._attached_object_pub.publish(aco)
             time.sleep(0.02)
-            
+
     def detach_box_from_gripper(self, object_id: str) -> None:
         """
         Detaches and removes the object.
@@ -213,7 +248,9 @@ class PlanAndExecuteClient(Node):
 
         pos = np.asarray(position_xyz, dtype=float).ravel()
         if pos.size != 3:
-            raise ValueError(f"position_xyz must have 3 components; got shape {pos.shape}.")
+            raise ValueError(
+                f"position_xyz must have 3 components; got shape {pos.shape}."
+            )
 
         q = np.asarray(quat_xyzw, dtype=float).ravel()
         if q.size != 4:
@@ -289,12 +326,16 @@ class PlanAndExecuteClient(Node):
             f"(subscribers={self._collision_object_pub.get_subscription_count()})"
         )
 
-    def remove_all_world_collision_objects(self, service_timeout_sec: float = 5.0) -> int:
+    def remove_all_world_collision_objects(
+        self, service_timeout_sec: float = 5.0
+    ) -> int:
         """
         Query MoveIt for world ``collision_objects``, then publish REMOVE for each id.
         Does not clear octomap or attached bodies (only ``PlanningSceneWorld.collision_objects``).
         """
-        if not self._get_planning_scene_cli.wait_for_service(timeout_sec=service_timeout_sec):
+        if not self._get_planning_scene_cli.wait_for_service(
+            timeout_sec=service_timeout_sec
+        ):
             self.get_logger().warn(
                 "/get_planning_scene not available; skipping world collision-object clear."
             )
@@ -343,7 +384,9 @@ class PlanAndExecuteClient(Node):
         service callback can take tens of seconds (unload controllers, reset
         world, respawn robot, respawn controllers).
         """
-        if not self._reset_simulation_cli.wait_for_service(timeout_sec=service_wait_sec):
+        if not self._reset_simulation_cli.wait_for_service(
+            timeout_sec=service_wait_sec
+        ):
             self.get_logger().warn(
                 f"/reset_simulation not available within {service_wait_sec}s "
                 "(start gz_moveit with simulation_reset_node, or disable reset)."
@@ -351,7 +394,9 @@ class PlanAndExecuteClient(Node):
             return False
 
         fut = self._reset_simulation_cli.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=reset_callback_timeout_sec)
+        rclpy.spin_until_future_complete(
+            self, fut, timeout_sec=reset_callback_timeout_sec
+        )
         if fut.result() is None:
             self.get_logger().error(
                 "Reset service call did not complete "
@@ -366,6 +411,20 @@ class PlanAndExecuteClient(Node):
 
         self.get_logger().error(f"Gazebo reset failed: {resp.message}")
         return False
+
+    def remove_gazebo_model(self, name: str) -> None:
+        """Remove a model from Gazebo via bridged Entity service."""
+        if self.remove_cli is None:
+            return
+        if not self.remove_cli.wait_for_service(timeout_sec=0.1):
+            return
+
+        from ros_gz_interfaces.srv import DeleteEntity
+
+        req = DeleteEntity.Request()
+        req.entity.name = name
+        req.entity.type = 2  # MODEL
+        return self.remove_cli.call_async(req)
 
     @staticmethod
     def _make_start_state(joint_names, joint_positions) -> RobotState:
@@ -544,7 +603,14 @@ class PlanAndExecuteClient(Node):
                 start_joint_names, start_joint_positions
             )
         else:
-            zero_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+            zero_names = [
+                "joint_1",
+                "joint_2",
+                "joint_3",
+                "joint_4",
+                "joint_5",
+                "joint_6",
+            ]
             ikr.robot_state = self._make_start_state(zero_names, [0.0] * 6)
 
         ikr.timeout.nanosec = int(timeout_sec * 1e9)
@@ -572,8 +638,8 @@ class PlanAndExecuteClient(Node):
         ori_tolerance_rpy: tuple[float, float, float] = (0.001, 0.001, 0.001),
         allowed_planning_time: float = 5.0,
         num_attempts: int = 5,
-        max_velocity_scaling: float = 0.2,
-        max_acceleration_scaling: float = 0.2,
+        max_velocity_scaling: float | None = None,
+        max_acceleration_scaling: float | None = None,
         planner_id: str = "",
         joint_1_constraints: float | None = None,
         joint_2_constraints: float | None = None,
@@ -603,12 +669,12 @@ class PlanAndExecuteClient(Node):
             "joint_5": joint_5_constraints,
             "joint_6": joint_6_constraints,
         }
-        
+
         active_consts = {k: v for k, v in joint_consts.items() if v is not None}
         if active_consts:
             path_c = Constraints()
             for jname, val in active_consts.items():
-                # Center constraint at 0.0 for most joints; joint_6 uses pi to 
+                # Center constraint at 0.0 for most joints; joint_6 uses pi to
                 # keep it in the [0, 2pi] range as requested by the user.
                 # NOTE: construct_using_validated.py home pos was updated to 1.57.
                 target_pos = np.pi if jname == "joint_6" else 0.0
@@ -622,12 +688,16 @@ class PlanAndExecuteClient(Node):
                 )
             mpr.path_constraints = path_c
 
-        if lock_wrist_to_start and start_joint_names is not None and start_joint_positions is not None:
+        if (
+            lock_wrist_to_start
+            and start_joint_names is not None
+            and start_joint_positions is not None
+        ):
             path_c = mpr.path_constraints
             if not path_c.joint_constraints:  # if empty
                 mpr.path_constraints = Constraints()
                 path_c = mpr.path_constraints
-            
+
             for jname in ["joint_4", "joint_6"]:
                 if jname in start_joint_names:
                     idx = start_joint_names.index(jname)
@@ -662,10 +732,76 @@ class PlanAndExecuteClient(Node):
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)
-        mpr.max_velocity_scaling_factor = float(max_velocity_scaling)
-        mpr.max_acceleration_scaling_factor = float(max_acceleration_scaling)
+
+        v_scale = (
+            max_velocity_scaling
+            if max_velocity_scaling is not None
+            else self._max_velocity_scaling
+        )
+        a_scale = (
+            max_acceleration_scaling
+            if max_acceleration_scaling is not None
+            else self._max_acceleration_scaling
+        )
+
+        mpr.max_velocity_scaling_factor = float(v_scale)
+        mpr.max_acceleration_scaling_factor = float(a_scale)
 
         return self._call_motion_plan(mpr)
+
+    def plan_cartesian_path(
+        self,
+        group_name: str,
+        link_name: str,
+        frame_id: str,
+        waypoints: list[Pose],
+        start_joint_names: list[str] | None = None,
+        start_joint_positions: list[float] | None = None,
+        max_step: float = 0.01,
+        jump_threshold: float = 0.0,
+        avoid_collisions: bool = True,
+    ) -> Optional[RobotTrajectory]:
+        """
+        Plan a linear Cartesian path through waypoints.
+        """
+        if not self._cartesian_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error("/compute_cartesian_path service not available.")
+            return None
+
+        from moveit_msgs.srv import GetCartesianPath
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = frame_id
+        req.header.stamp = self.get_clock().now().to_msg()
+
+        if start_joint_names and start_joint_positions:
+            req.start_state = self._make_start_state(
+                start_joint_names, start_joint_positions
+            )
+
+        req.group_name = group_name
+        req.link_name = link_name
+        req.waypoints = waypoints
+        req.max_step = max_step
+        req.jump_threshold = jump_threshold
+        req.avoid_collisions = avoid_collisions
+
+        fut = self._cartesian_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
+
+        if fut.result() is None:
+            self.get_logger().error("Cartesian planning service call failed.")
+            return None
+
+        res = fut.result()
+        if res.fraction < 1.0:
+            self.get_logger().warn(
+                f"Cartesian path only planned {res.fraction * 100:.1f}%"
+            )
+            if res.fraction < 0.5:
+                return None
+
+        return res.solution
 
     def plan_gripper_to_joint_positions(
         self,
@@ -677,8 +813,8 @@ class PlanAndExecuteClient(Node):
         tolerance: float = 1e-3,
         allowed_planning_time: float = 2.0,
         num_attempts: int = 3,
-        max_velocity_scaling: float = 1.0,
-        max_acceleration_scaling: float = 1.0,
+        max_velocity_scaling: float | None = None,
+        max_acceleration_scaling: float | None = None,
         planner_id: str = "",
     ) -> Optional[RobotTrajectory]:
         """
@@ -689,7 +825,9 @@ class PlanAndExecuteClient(Node):
           goal_joint_positions = [0.01, 0.01]
         """
         if len(goal_joint_names) != len(goal_joint_positions):
-            self.get_logger().error("goal_joint_names and goal_joint_positions must match.")
+            self.get_logger().error(
+                "goal_joint_names and goal_joint_positions must match."
+            )
             return None
 
         mpr = MotionPlanRequest()
@@ -716,8 +854,20 @@ class PlanAndExecuteClient(Node):
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)
-        mpr.max_velocity_scaling_factor = float(max_velocity_scaling)
-        mpr.max_acceleration_scaling_factor = float(max_acceleration_scaling)
+
+        v_scale = (
+            max_velocity_scaling
+            if max_velocity_scaling is not None
+            else self._max_velocity_scaling
+        )
+        a_scale = (
+            max_acceleration_scaling
+            if max_acceleration_scaling is not None
+            else self._max_acceleration_scaling
+        )
+
+        mpr.max_velocity_scaling_factor = float(v_scale)
+        mpr.max_acceleration_scaling_factor = float(a_scale)
 
         return self._call_motion_plan(mpr)
 
@@ -802,9 +952,7 @@ class PlanAndExecuteClient(Node):
             return False
 
         if not result.result.success:
-            self.get_logger().error(
-                f"EGM execution failed: {result.result.message}"
-            )
+            self.get_logger().error(f"EGM execution failed: {result.result.message}")
             return False
 
         self.get_logger().info("EGM execution succeeded.")
@@ -822,7 +970,9 @@ class PlanAndExecuteClient(Node):
             return False
 
         if not action_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("FollowJointTrajectory action server not available.")
+            self.get_logger().error(
+                "FollowJointTrajectory action server not available."
+            )
             return False
 
         traj = JointTrajectory()
@@ -830,7 +980,9 @@ class PlanAndExecuteClient(Node):
 
         point = JointTrajectoryPoint()
         point.positions = list(positions)
-        point.time_from_start = Duration(sec=int(duration_sec), nanosec=int((duration_sec % 1.0) * 1e9))
+        point.time_from_start = Duration(
+            sec=int(duration_sec), nanosec=int((duration_sec % 1.0) * 1e9)
+        )
         traj.points = [point]
 
         goal = FollowJointTrajectory.Goal()
@@ -886,7 +1038,9 @@ class PlanAndExecuteClient(Node):
             return False
 
         if not self.arm_traj_ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("FollowJointTrajectory action server not available.")
+            self.get_logger().error(
+                "FollowJointTrajectory action server not available."
+            )
             return False
 
         goal = FollowJointTrajectory.Goal()
@@ -897,7 +1051,9 @@ class PlanAndExecuteClient(Node):
         goal_handle = send_future.result()
 
         if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error("replay_arm_trajectory: goal rejected by controller.")
+            self.get_logger().error(
+                "replay_arm_trajectory: goal rejected by controller."
+            )
             return False
 
         result_future = goal_handle.get_result_async()
@@ -936,7 +1092,9 @@ class PlanAndExecuteClient(Node):
 
     def _egm_send_gripper(self, position: float) -> bool:
         if not self._egm_gripper_cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("/egm_controller/control/set_gripper service not available.")
+            self.get_logger().error(
+                "/egm_controller/control/set_gripper service not available."
+            )
             return False
 
         req = SetBool.Request()
@@ -950,7 +1108,9 @@ class PlanAndExecuteClient(Node):
             return False
 
         if not fut.result().success:
-            self.get_logger().error(f"EGM gripper command failed: {fut.result().message}")
+            self.get_logger().error(
+                f"EGM gripper command failed: {fut.result().message}"
+            )
             return False
 
         action = "closed" if position > 1e-6 else "opened"
@@ -965,7 +1125,9 @@ class PlanAndExecuteClient(Node):
         joint_name: str,
     ) -> bool:
         if not self.gripper_cmd_ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("ParallelGripperCommand action server not available.")
+            self.get_logger().error(
+                "ParallelGripperCommand action server not available."
+            )
             return False
 
         goal = ParallelGripperCommand.Goal()
@@ -1000,7 +1162,9 @@ class PlanAndExecuteClient(Node):
         )
         return True
 
+
 # Some helper functions!!!!!!
+
 
 def place_obstacles(node):
     for i in range(len(goal_pos)):
@@ -1009,60 +1173,63 @@ def place_obstacles(node):
             frame_id="world",
             size_xyz=BRICK_SIZE_XYZ,
             position_xyz=goal_pos[i],
-            quat_xyzw=goal_quat[i])
+            quat_xyzw=goal_quat[i],
+        )
+
 
 def move(position, quaternion, node):
     # Move to the position with the quaternion
     # the actual moveit code or whatever
     # TODO: move to location. and throw false if it cant?
-    
+
     arm_traj = node.plan_arm_to_pose_constraints(
         group_name="arm",
         link_name=node.tcp_link,
         frame_id="world",
         goal_xyz=tuple(position),
         goal_quat_xyzw=tuple(quaternion),
-        joint_6_constraints=4.0
+        joint_6_constraints=4.0,
     )
     if arm_traj is not None:
         node.execute_moveit_trajectory(arm_traj)
 
     return True
 
-def grip(state,node):
+
+def grip(state, node):
     # TODO: gripper activate. and throw false if it cant?
     gripper_open = 0.0
-    gripper_closed = 0.01
+    gripper_closed = 0.005
     if state:
         # TODO grip
         node.send_gripper_command(
-        position=gripper_closed,
-        max_velocity=0.05,
-    ) 
+            position=gripper_closed,
+            max_velocity=0.05,
+        )
     else:
-        # TODO ungrip 
+        # TODO ungrip
         node.send_gripper_command(
-        position=gripper_open,
-        max_velocity=0.05,
-    ) 
+            position=gripper_open,
+            max_velocity=0.05,
+        )
 
-    return True 
+    return True
 
-# inputs: 
+
+# inputs:
 #   - Supply brick location + orientation
-#   - Goal brick location + orientation 
-# Outputs: 
-#   - Trajectory to lead in, grasp brick, lead out, lead in to goal location, place brick 
-#  
+#   - Goal brick location + orientation
+# Outputs:
+#   - Trajectory to lead in, grasp brick, lead out, lead in to goal location, place brick
+#
 
-BRICK_SIZE_XYZ = (0.051, 0.023, 0.014)# just test the obstacle placement 
+BRICK_SIZE_XYZ = (0.051, 0.023, 0.014)  # just test the obstacle placement
 
-goal_pos = np.array([[0.35, -0.26, 0.04],
-                         [0.35, -0.26, 0.075]])
+goal_pos = np.array([[0.35, -0.26, 0.04], [0.35, -0.26, 0.075]])
 
-# quats are in xyzw format 
-goal_quat = np.array([[0,1,0, 0],
-                      [ 0, 0, 0.3826834, 0.9238796 ]])
+# quats are in xyzw format
+goal_quat = np.array([[0, 1, 0, 0], [0, 0, 0.3826834, 0.9238796]])
+
 
 def plan_brick_placement(
     node,
@@ -1085,7 +1252,9 @@ def plan_brick_placement(
     if reset_simulation:
         node.get_logger().info("Resetting Gazebo (via /reset_simulation)…")
         if not node.reset_gazebo_simulation():
-            node.get_logger().error("Aborting plan_brick_placement after failed simulation reset.")
+            node.get_logger().error(
+                "Aborting plan_brick_placement after failed simulation reset."
+            )
             return
 
     # Drop all user-added world objects from a previous run (ids unknown).
@@ -1097,7 +1266,7 @@ def plan_brick_placement(
     # 2. grasp brick
     node.get_logger().info("2. grasp brick")
     grip(True, node)
-    # 3. lead out  
+    # 3. lead out
     node.get_logger().info("3. lead out")
     move([float(s[0]), float(s[1]), float(s[2] + 0.1)], supply_quat_xyzw, node)
     # 4. lead in to goal location
@@ -1115,14 +1284,16 @@ def plan_brick_placement(
         quat_xyzw=(float(qg[0]), float(qg[1]), float(qg[2]), float(qg[3])),
     )
 
+
 def main():
     rclpy.init()
     node = PlanAndExecuteClient()
     # brick_og = [0.000, 0.480, 0.032]
     brick_og = [0.000, 0.480, 0.030]
 
-    plan_brick_placement(node, brick_og, [0,1,0,0], 
-                               [0.35, -0.26, 0.075], [0,1,0,0])
+    plan_brick_placement(
+        node, brick_og, [0, 1, 0, 0], [0.35, -0.26, 0.075], [0, 1, 0, 0]
+    )
 
     # Keep the node alive briefly so discovery + transient-local delivery can finish.
     for _ in range(80):

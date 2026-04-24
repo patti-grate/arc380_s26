@@ -34,6 +34,16 @@ services:
       - "6080:6080"
     environment:
       - SIM_WORLD_FILE=validation_workcell.sdf
+    volumes:
+      - ../workshops:/ros2_ws/workshops
+      - ../scripts:/ros2_ws/scripts
+      - ../realsense_shared:/ros2_ws/realsense_shared
+      - ../training_data:/ros2_ws/training_data
+      - ../workshops:/workshops
+      - ../scripts:/scripts
+      - ../src:/ros2_ws/src
+      - ../src/abb_irb120_gazebo/launch/gz_moveit.launch.py:/ros2_ws/install/abb_irb120_gazebo/share/abb_irb120_gazebo/launch/gz_moveit.launch.py
+      - ../src/abb_irb120_gazebo/worlds/validation_workcell.sdf:/ros2_ws/install/abb_irb120_gazebo/share/abb_irb120_gazebo/worlds/validation_workcell.sdf
     # no command override, so entrypoint.sh runs simulation by default
 
   ros2_real:

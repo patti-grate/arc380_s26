@@ -8,7 +8,7 @@ Workflow
 --------
 1. Load a validated 7D brick sequence (from training_data/batch1/validated_simPhysics).
 2. For each brick in the sequence:
-   a. Try each of the 6 pre-defined grasping poses (extracted from grasping_poses.3dm).
+   a. Try each of the # pre-defined grasping poses (extracted from grasping_poses.3dm).
    b. For each grasp candidate, plan a full pick-and-place trajectory via
       trajectory_planner_draft.PlanAndExecuteClient.
    c. Use the first grasp that plans collision-free for all phases.
@@ -72,14 +72,20 @@ try:
     sys.path.insert(0, os.path.dirname(__file__))
     from trajectory_planner_draft_JG import PlanAndExecuteClient
 
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "examples"))
-    from egm_example import EGMClient
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "examples"))
+        from egm_example import EGMClient
+
+        HAVE_EGM = True
+    except ImportError as e2:
+        HAVE_EGM = False
+        print(f"WARNING: egm_example not importable ({e2}). Real robot mode disabled.")
 
     HAVE_ROS2 = True
-except ImportError:
+except ImportError as e:
     HAVE_ROS2 = False
     print(
-        "WARNING: rclpy / trajectory_planner_draft not importable. "
+        f"WARNING: rclpy / trajectory_planner_draft not importable: {e}\n"
         "Script will validate logic only (planning calls are no-ops)."
     )
 
@@ -123,49 +129,80 @@ def _t(rot_cols: list[list[float]], pos: list[float]) -> np.ndarray:
     return T
 
 
-# grasp5 is the identity-like top-down approach (same orientation as brick frame)
-# grasp6 is 180 deg Z-rotated top-down
-# grasp1/2 approach from the +X side of brick; grasp3/4 from -X side
 # Axis columns are [X_col, Y_col, Z_col] reconstructed from the Rhino extraction.
 
-T_GRASP_OFFSETS: dict[str, np.ndarray] = {
-    # Derived from grasping_poses.3dm
-    "grasp1": _t(
-        rot_cols=[
-            [0.7071, 0.0000, -0.7071],
-            [0.0000, -1.0000, 0.0000],
-            [-0.7071, 0.0000, -0.7071],
-        ],
-        pos=[0.0176, 0.0000, 0.0028],
-    ),
-    "grasp2": _t(
-        rot_cols=[
-            [-0.7071, 0.0000, 0.7071],
-            [0.0000, 1.0000, 0.0000],
-            [-0.7071, 0.0000, -0.7071],
-        ],
-        pos=[0.0176, 0.0000, 0.0028],
-    ),
-    "grasp3": _t(
-        rot_cols=[
-            [1.0000, 0.0000, 0.0000],
-            [0.0000, -1.0000, 0.0000],
-            [0.0000, 0.0000, -1.0000],
-        ],
-        pos=[0.0000, 0.0000, 0.0000],
-    ),
-    "grasp4": _t(
-        rot_cols=[
-            [-1.0000, 0.0000, 0.0000],
-            [0.0000, 1.0000, 0.0000],
-            [0.0000, 0.0000, -1.0000],
-        ],
-        pos=[0.0000, 0.0000, 0.0000],
-    ),
-}
+import os
 
-# Ordered list for sequential trial
-GRASP_ORDER: list[str] = ["grasp1", "grasp2", "grasp3", "grasp4"]
+def _load_dynamic_grasps(filepath: str):
+    import rhino3dm
+    if not os.path.exists(filepath):
+        print(f"[warning] Grasp file not found: {filepath}. Using empty grasps.")
+        return {}, []
+    
+    m = rhino3dm.File3dm.Read(filepath)
+    if not m:
+        return {}, []
+
+    grasps = {}
+    for layer in m.Layers:
+        name = layer.Name
+        if name.startswith("grasping_pose"):
+            grasps[name] = None
+            
+    brick_center = np.array([0.0, 0.42, 0.0315])  # fallback
+    for o in m.Objects:
+        if m.Layers[o.Attributes.LayerIndex].Name == "brick_pose":
+            if isinstance(o.Geometry, rhino3dm.Point):
+                brick_center = np.array([
+                    o.Geometry.Location.X,
+                    o.Geometry.Location.Y,
+                    o.Geometry.Location.Z
+                ])
+                break
+
+    for name in list(grasps.keys()):
+        pt = None
+        curves = []
+        for o in m.Objects:
+            if m.Layers[o.Attributes.LayerIndex].Name == name:
+                if isinstance(o.Geometry, rhino3dm.Point):
+                    pt = o.Geometry
+                elif isinstance(o.Geometry, rhino3dm.PolylineCurve):
+                    curves.append(o.Geometry)
+        
+        if pt and len(curves) == 3:
+            origin = np.array([pt.Location.X, pt.Location.Y, pt.Location.Z])
+            pos = origin - brick_center
+            
+            vecs = []
+            for c in curves:
+                start = np.array([c.Point(0).X, c.Point(0).Y, c.Point(0).Z])
+                end = np.array([c.Point(c.PointCount-1).X, c.Point(c.PointCount-1).Y, c.Point(c.PointCount-1).Z])
+                vec = end - start
+                vecs.append(vec)
+            
+            vecs.sort(key=np.linalg.norm)
+            z_vec = vecs[0] / np.linalg.norm(vecs[0])
+            y_vec = vecs[1] / np.linalg.norm(vecs[1])
+            x_vec = vecs[2] / np.linalg.norm(vecs[2])
+            
+            y_vec = np.cross(z_vec, x_vec)
+            
+            T = np.eye(4)
+            T[:3, 0] = x_vec
+            T[:3, 1] = y_vec
+            T[:3, 2] = z_vec
+            T[:3, 3] = pos
+            
+            short_name = name.replace("ing_pose", "")
+            grasps[short_name] = T
+
+    valid_grasps = {k: v for k, v in grasps.items() if v is not None}
+    order = sorted(valid_grasps.keys())
+    return valid_grasps, order
+
+_RHINO_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "grasping_poses", "grasping_poses.3dm"))
+T_GRASP_OFFSETS, GRASP_ORDER = _load_dynamic_grasps(_RHINO_PATH)
 
 # Default supply pallet pose -- x, y, z (flat brick, no rotation for now)
 DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, -0.40, 0.030)
@@ -233,7 +270,7 @@ def _gz_spawn(name: str, pose_7d: np.ndarray) -> bool:
     if not os.path.isfile(_SDF_PATH):
         print(f"  [gz] WARNING: SDF not found at {_SDF_PATH}, skipping visual spawn.")
         return False
-    x, y, z = pose_7d[0], pose_7d[1], pose_7d[2] + 0.001
+    x, y, z = pose_7d[0], pose_7d[1], pose_7d[2] + 0.005
     qx, qy, qz, qw = pose_7d[3], pose_7d[4], pose_7d[5], pose_7d[6]
     req = (
         f'sdf_filename: \\"{_SDF_PATH}\\" '
@@ -253,16 +290,48 @@ def _gz_spawn(name: str, pose_7d: np.ndarray) -> bool:
     return ok
 
 
-def _gz_remove(name: str) -> None:
-    """Remove a named model from Gazebo."""
-    cmd = (
-        f"gz service -s /world/{_WORLD_NAME}/remove "
-        f"--reqtype gz.msgs.Entity --reptype gz.msgs.Boolean "
-        f"--timeout 500 --req 'name: \"{name}\" type: MODEL'"
-    )
-    subprocess.run(
-        cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+def _gz_get_pose(name: str):
+    """Query Gazebo for the true 7D pose [x,y,z,qx,qy,qz,qw] of a model."""
+    import re
+    cmd = f'gz model -m {name}'
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2.0)
+        if result.returncode != 0:
+            return None
+        out = result.stdout
+        
+        pos_match = re.search(r"position\s*\{.*?x:\s*([-\d\.e]+).*?y:\s*([-\d\.e]+).*?z:\s*([-\d\.e]+)", out, re.DOTALL)
+        ori_match = re.search(r"orientation\s*\{.*?x:\s*([-\d\.e]+).*?y:\s*([-\d\.e]+).*?z:\s*([-\d\.e]+).*?w:\s*([-\d\.e]+)", out, re.DOTALL)
+        
+        if pos_match and ori_match:
+            x, y, z = float(pos_match.group(1)), float(pos_match.group(2)), float(pos_match.group(3))
+            qx, qy, qz, qw = float(ori_match.group(1)), float(ori_match.group(2)), float(ori_match.group(3)), float(ori_match.group(4))
+            return np.array([x, y, z, qx, qy, qz, qw])
+    except Exception:
+        pass
+    return None
+
+def _gz_remove_batch(brick_names: list[str]) -> None:
+    """Remove a list of named models from Gazebo in parallel."""
+    processes = []
+    for name in brick_names:
+        cmd = f'source /opt/ros/jazzy/setup.bash && gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req "name: \\"{name}\\" type: 2"'
+        # Use executable='/bin/bash' because 'source' is a bash built-in
+        p = subprocess.Popen(
+            cmd,
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        processes.append(p)
+
+    # Wait for all removals to finish
+    for p in processes:
+        p.wait()
+
+    # Shorter settle time
+    time.sleep(1.0)
 
 
 _SUPPLY_GZ_NAME = "supply_brick_gz"  # Gazebo model name for the feeding brick
@@ -294,46 +363,48 @@ def _gz_fetch_model_names() -> list[str]:
 def _gz_clean_scene(node: "PlanAndExecuteClient | None") -> None:
     """
     Fully clean the Gazebo world and MoveIt planning scene before construction.
-
-    Mirrors demo_validation.py reset_world():
-      1. Trigger ControlWorld reset (respawns default bricks -- we remove them next).
-      2. Remove brick_00 .. brick_24  (the 20 pre-existing bricks that respawn).
-      3. Remove construct_brick_* and supply_brick_gz from any prior run.
-      4. Clear the MoveIt planning scene via remove_all_world_collision_objects().
     """
-    print("[gz] Cleaning Gazebo scene (mirroring demo_validation reset_world)...")
+    print("[gz] Cleaning Gazebo scene...")
 
-    # Step 1: world reset via the node's existing helper (ControlWorld service)
-    if node is not None:
-        print("[gz]   Step 1: Triggering ControlWorld reset...")
-        ok = node.reset_gazebo_simulation()  # calls /reset_simulation service
-        if ok:
-            print("[gz]   Reset acknowledged. Waiting for world to settle...")
-            time.sleep(1.5)
-        else:
-            print("[gz]   WARNING: ControlWorld reset failed or timed out.")
+    # Step 1: purge brick_00 .. brick_24
+    print("[gz]   Removing pre-existing brick_00..brick_24...")
+    bricks_to_remove = [f"brick_{i:02d}" for i in range(25)]
 
-    # Step 2: purge brick_00 .. brick_24 (pre-existing bricks that respawn)
-    print("[gz]   Step 2: Removing pre-existing brick_00..brick_24...")
-    for i in range(25):
-        _gz_remove(f"brick_{i:02d}")
-
-    # Step 3: purge our own construct_brick_* and supply_brick_gz
-    print("[gz]   Step 3: Removing construct_brick_* and supply_brick_gz...")
+    # Step 2: purge our own construct_brick_* and supply_brick_gz
     names = _gz_fetch_model_names()
     to_remove = [
         n for n in names if n.startswith("construct_brick_") or n == _SUPPLY_GZ_NAME
     ]
-    for name in to_remove:
-        _gz_remove(name)
-    if to_remove:
-        print(f"[gz]   Removed {len(to_remove)} leftover construct model(s).")
+    bricks_to_remove.extend(to_remove)
 
-    time.sleep(1.0)  # let Gazebo finish all removals
-
-    # Step 4: clear MoveIt planning scene
     if node is not None:
-        print("[gz]   Step 4: Clearing MoveIt planning scene...")
+        print("[gz]   Calling Gazebo Reset service...")
+        node.reset_gazebo_simulation()
+        time.sleep(1.0)
+
+        if bricks_to_remove:
+            print(
+                f"[gz]   Removing {len(bricks_to_remove)} models via gz service subprocesses..."
+            )
+            _gz_remove_batch(bricks_to_remove)
+
+        # Briefly wait for the physics engine to settle
+        time.sleep(0.5)
+    else:
+        print("[gz]   Calling Gazebo Reset service via subprocess...")
+        subprocess.run(
+            "source /opt/ros/jazzy/setup.bash && gz service -s /world/irb120_workcell/control --reqtype gz.msgs.WorldControl --req 'reset: {all: true}'",
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.0)
+        _gz_remove_batch(bricks_to_remove)
+
+    # Step 3: clear MoveIt planning scene
+    if node is not None:
+        print("[gz]   Clearing MoveIt planning scene...")
         node.remove_all_world_collision_objects()
 
     print("[gz] Scene cleanup complete.")
@@ -508,6 +579,21 @@ def _deserialize_traj(data: dict):
     return rt
 
 
+def _scale_trajectory_speed(traj, speed_factor: float):
+    """Scale the timestamps, velocities, and accelerations of a RobotTrajectory."""
+    if speed_factor == 1.0 or traj is None:
+        return traj
+    jt = traj.joint_trajectory
+    for pt in jt.points:
+        t_total = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+        t_scaled = t_total / speed_factor
+        pt.time_from_start.sec = int(t_scaled)
+        pt.time_from_start.nanosec = int((t_scaled - int(t_scaled)) * 1e9)
+        pt.velocities = [v * speed_factor for v in pt.velocities]
+        pt.accelerations = [a * (speed_factor**2) for a in pt.accelerations]
+    return traj
+
+
 def _apply_j6_offset(traj, offset_rad: float):
     """Shift joint_6 in every trajectory point by offset_rad.
 
@@ -543,9 +629,11 @@ def _build_brick_steps(
         if traj is not None:
             steps.append({"type": "traj", "label": label, **_serialize_traj(traj)})
         if label == "grasp_supply":
+            steps.append({"type": "sleep", "sec": 0.2})
             steps.append({"type": "gripper", "action": "close"})
             steps.append({"type": "sleep", "sec": 0.5})
         elif label == "place_goal":
+            steps.append({"type": "sleep", "sec": 0.2})
             steps.append({"type": "gripper", "action": "open"})
             steps.append({"type": "sleep", "sec": 0.5})
     return {
@@ -632,32 +720,62 @@ def plan_brick_sequence(
     current_start_state = None
 
     def _plan_phase(
-        label: str, xyz, quat, lock_wrist: bool = False, wrist_tolerance: float = 0.4
+        label: str,
+        xyz,
+        quat,
+        lock_wrist: bool = False,
+        wrist_tolerance: float = 0.4,
+        speed_factor: float = 1.0,
+        cartesian: bool = False,
     ) -> bool:
         nonlocal current_start_state
         start_names, start_positions = (
             current_start_state if current_start_state else (None, None)
         )
 
-        traj = node.plan_arm_to_pose_constraints(
-            group_name="arm",
-            link_name=node.tcp_link,
-            frame_id="world",
-            goal_xyz=tuple(float(v) for v in xyz),
-            goal_quat_xyzw=tuple(float(v) for v in quat),
-            joint_4_constraints=2.79,  # ±160 deg (physical limit)
-            joint_5_constraints=2.09,  # ±120 deg (physical limit)
-            joint_6_constraints=3.14,  # ±180 deg (keeps wrist within [0, 2pi])
-            allowed_planning_time=6.0,
-            num_attempts=5,
-            start_joint_names=start_names,
-            start_joint_positions=start_positions,
-            lock_wrist_to_start=lock_wrist,
-            lock_wrist_tolerance=wrist_tolerance,
-        )
+        if cartesian:
+            from geometry_msgs.msg import Pose
+            target_pose = Pose()
+            target_pose.position.x = float(xyz[0])
+            target_pose.position.y = float(xyz[1])
+            target_pose.position.z = float(xyz[2])
+            target_pose.orientation.x = float(quat[0])
+            target_pose.orientation.y = float(quat[1])
+            target_pose.orientation.z = float(quat[2])
+            target_pose.orientation.w = float(quat[3])
+            
+            traj = node.plan_cartesian_path(
+                group_name="arm",
+                link_name=node.tcp_link,
+                frame_id="world",
+                waypoints=[target_pose],
+                start_joint_names=start_names,
+                start_joint_positions=start_positions,
+                avoid_collisions=True,
+            )
+        else:
+            traj = node.plan_arm_to_pose_constraints(
+                group_name="arm",
+                link_name=node.tcp_link,
+                frame_id="world",
+                goal_xyz=tuple(float(v) for v in xyz),
+                goal_quat_xyzw=tuple(float(v) for v in quat),
+                joint_4_constraints=2.79,  # ±160 deg (physical limit)
+                joint_5_constraints=2.09,  # ±120 deg (physical limit)
+                joint_6_constraints=3.14,  # ±180 deg (keeps wrist within [0, 2pi])
+                allowed_planning_time=6.0,
+                num_attempts=5,
+                start_joint_names=start_names,
+                start_joint_positions=start_positions,
+                lock_wrist_to_start=lock_wrist,
+                lock_wrist_tolerance=wrist_tolerance,
+            )
         if traj is None:
             log_info(f"    [FAIL] Plan failed at {label} for {grasp_id}")
             return False
+
+        if speed_factor != 1.0:
+            traj = _scale_trajectory_speed(traj, speed_factor)
 
         plans.append(traj)
         next_state = _extract_last_state(traj)
@@ -685,7 +803,7 @@ def plan_brick_sequence(
     if not _plan_phase("hover_supply", supply_hover, supply_tcp_quat):
         return None
     if not _plan_phase(
-        "grasp_supply", supply_tcp_xyz, supply_tcp_quat, lock_wrist=True
+        "grasp_supply", supply_tcp_xyz, supply_tcp_quat, lock_wrist=True, cartesian=True
     ):
         return None
 
@@ -695,7 +813,7 @@ def plan_brick_sequence(
 
     try:
         if not _plan_phase(
-            "lift_supply", supply_hover, supply_tcp_quat, lock_wrist=True
+            "lift_supply", supply_hover, supply_tcp_quat, lock_wrist=True, cartesian=True
         ):
             return None
         # hover_goal is the long transit: do NOT lock the wrist here.
@@ -705,7 +823,9 @@ def plan_brick_sequence(
         # The spin is cosmetic; correctness requires leaving the wrist free.
         if not _plan_phase("hover_goal", goal_hover, goal_tcp_quat):
             return None
-        if not _plan_phase("place_goal", goal_tcp_xyz, goal_tcp_quat, lock_wrist=True):
+        if not _plan_phase(
+            "place_goal", goal_tcp_xyz, goal_tcp_quat, lock_wrist=True, speed_factor=0.3, cartesian=True
+        ):
             return None
     finally:
         # GHOST DETACH: Release the attached object.  MoveIt puts detached objects
@@ -715,7 +835,15 @@ def plan_brick_sequence(
             node.detach_box_from_gripper(ghost_id)
             node.remove_scene_object(ghost_id)
 
-    if not _plan_phase("retract_goal", goal_hover, goal_tcp_quat, lock_wrist=True):
+    if not _plan_phase(
+        "retract_goal",
+        goal_hover,
+        goal_tcp_quat,
+        lock_wrist=True,
+        wrist_tolerance=0.8,
+        speed_factor=0.5,
+        cartesian=True,
+    ):
         return None
 
     def _plan_return_home() -> bool:
@@ -795,6 +923,7 @@ def execute_brick_sequence(
 
     # 3. Close gripper
     if not dry_run:
+        time.sleep(0.2)
         node.send_gripper_command(position=0.01, max_velocity=0.05)
     if not dry_run:
         time.sleep(0.5)
@@ -813,6 +942,7 @@ def execute_brick_sequence(
 
     # 7. Open gripper
     if not dry_run:
+        time.sleep(0.2)
         node.send_gripper_command(position=0.0, max_velocity=0.05)
     if not dry_run:
         time.sleep(0.5)
@@ -932,7 +1062,7 @@ def run_construction(
             active_grasps = [forced_grasp]
         else:
             active_grasps = (
-                ["grasp1", "grasp2"] if is_standing else ["grasp3", "grasp4"]
+                ["grasp1", "grasp2"] if is_standing else ["grasp3", "grasp1", "grasp2"]
             )
 
         print(
@@ -946,30 +1076,50 @@ def run_construction(
         best_grasp_id = None
 
         gz_name = f"construct_brick_{brick_idx:03d}"
+        current_supply_7d = supply_7d_base.copy()
 
-        for fb_goal_7d, fb_supply_7d, fallback_desc in generate_fallback_poses(
-            original_goal_7d, supply_7d_base
-        ):
+        # Physics-Based Pickup Pose
+        if mode == MODE_SIM:
+            _gz_spawn(gz_name, current_supply_7d)
+            # Give Gazebo physics 1.0s to let the brick drop and settle perfectly
+            import time
+            time.sleep(1.0)
+            
+            settled_pose = _gz_get_pose(gz_name)
+            if settled_pose is not None:
+                print(f"  [gz] Physical resting pose acquired: z={settled_pose[2]:.4f}")
+                current_supply_7d = settled_pose
+            else:
+                print(f"  [gz] Warning: Could not query resting pose, using default.")
+
+        # Try preferred grasps first, then fallback to all 3 if needed
+        grasps_to_try = active_grasps + [
+            g for g in GRASP_ORDER if g not in active_grasps
+        ]
+
+        for grasp_id in grasps_to_try:
             if best_plans is not None:
                 break
 
-            for grasp_id in active_grasps:
-                T_rel = T_GRASP_OFFSETS[grasp_id].copy()
+            T_rel = T_GRASP_OFFSETS[grasp_id].copy()
 
-                if mode == MODE_REAL:
-                    # Physical gripper is installed 45 degrees CCW (+45 deg around Z).
-                    # Compensate by rotating the MoveIt target TCP frame 45 degrees CW (-45 deg).
-                    rad = np.radians(-45.0)
-                    Rz_correction = np.array(
-                        [
-                            [np.cos(rad), -np.sin(rad), 0.0, 0.0],
-                            [np.sin(rad), np.cos(rad), 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ]
-                    )
-                    T_rel = T_rel @ Rz_correction
+            if mode == MODE_REAL:
+                # Physical gripper is installed 45 degrees CCW (+45 deg around Z).
+                # Compensate by rotating the MoveIt target TCP frame 45 degrees CW (-45 deg).
+                rad = np.radians(-45.0)
+                Rz_correction = np.array(
+                    [
+                        [np.cos(rad), -np.sin(rad), 0.0, 0.0],
+                        [np.sin(rad), np.cos(rad), 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ]
+                )
+                T_rel = T_rel @ Rz_correction
 
+            for fb_goal_7d, fb_supply_7d, fallback_desc in generate_fallback_poses(
+                original_goal_7d, current_supply_7d
+            ):
                 plans = plan_brick_sequence(
                     node,
                     supply_7d=fb_supply_7d,
@@ -981,7 +1131,7 @@ def run_construction(
 
                 if plans is not None:
                     print(
-                        f"  [OK] Found valid sequence: {fallback_desc}, Grasp=[{grasp_id}]"
+                        f"  [OK] Found valid grasp: {fallback_desc}, Grasp=[{grasp_id}]"
                     )
                     best_plans = plans
                     best_goal_7d = fb_goal_7d
@@ -1002,8 +1152,8 @@ def run_construction(
             node,
             best_plans,
             mode,
-            gz_spawn_callable=_gz_spawn,
-            gz_spawn_args=(gz_name, best_supply_7d),
+            gz_spawn_callable=None,
+            gz_spawn_args=None,
         )
 
         if not exec_ok:
@@ -1082,6 +1232,7 @@ def run_replay(
     sequence_path: str,
     *,
     mode: str,
+    speed_replay: float = 1.0,
 ) -> None:
     """
     Load a JSON sequence exported by run_construction (--export-dir) and
@@ -1161,8 +1312,29 @@ def run_replay(
                     traj = _deserialize_traj(step)
                     if mode == MODE_REAL:
                         traj = _apply_j6_offset(traj, REAL_GRIPPER_J6_OFFSET_RAD)
-                    print(f"    [replay] executing {label}")
-                    ok = node.replay_arm_trajectory(traj)
+
+                    if speed_replay != 1.0:
+                        # Scale the time and velocities in the trajectory
+                        jt = traj.joint_trajectory
+                        for pt in jt.points:
+                            t_total = (
+                                pt.time_from_start.sec
+                                + pt.time_from_start.nanosec * 1e-9
+                            )
+                            t_scaled = t_total / speed_replay
+                            pt.time_from_start.sec = int(t_scaled)
+                            pt.time_from_start.nanosec = int(
+                                (t_scaled - int(t_scaled)) * 1e9
+                            )
+
+                            # Scale velocities and accelerations
+                            pt.velocities = [v * speed_replay for v in pt.velocities]
+                            pt.accelerations = [
+                                a * (speed_replay**2) for a in pt.accelerations
+                            ]
+
+                    print(f"    [replay] executing {label} (speed={speed_replay}x)")
+                    ok = node.execute_moveit_trajectory(traj)
                     if not ok:
                         print(
                             f"    [replay][WARN] {label} controller rejected — skipping"
@@ -1205,16 +1377,6 @@ def run_replay(
 
 
 def parse_args() -> argparse.Namespace:
-    default_data = os.path.normpath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "training_data",
-            "batch1",
-            "validated_simPhysics",
-        )
-    )
-
     p = argparse.ArgumentParser(
         description=(
             "Pick-and-place construction from a validated demo sequence.\n"
@@ -1226,14 +1388,19 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
+        "--batch",
+        default="batch1",
+        help="Batch name inside training_data/ (default: batch1)",
+    )
+    p.add_argument(
         "--demo",
         default="demo_0",
         help="Demo name in validated_simPhysics/ (default: demo_0)",
     )
     p.add_argument(
         "--data-dir",
-        default=default_data,
-        help="Root directory of validated sequences (default: training_data/batch0/validated_simPhysics)",
+        default=None,
+        help="Override root directory of validated sequences. If not given, derived from --batch.",
     )
 
     # Mutually exclusive execution modes
@@ -1278,6 +1445,13 @@ def parse_args() -> argparse.Namespace:
         help=f"Hover height above pick/place poses in metres (default: {DEFAULT_HOVER_Z})",
     )
     p.add_argument(
+        "--structure-z-offset",
+        type=float,
+        default=0.0,
+        metavar="METRES",
+        help="Vertical offset to apply to the entire target structure (default: 0.0)",
+    )
+    p.add_argument(
         "--export-dir",
         default=None,
         metavar="DIR",
@@ -1294,6 +1468,24 @@ def parse_args() -> argparse.Namespace:
         help="Disable the automatic export of planned trajectories after a successful run.",
     )
     p.add_argument(
+        "--speed-sim",
+        type=float,
+        default=0.5,
+        help="Max velocity scaling for simulation (default: 0.5)",
+    )
+    p.add_argument(
+        "--speed-real",
+        type=float,
+        default=0.13,
+        help="Max velocity scaling for real robot planning (default: 0.13)",
+    )
+    p.add_argument(
+        "--speed-replay",
+        type=float,
+        default=1.0,
+        help="Execution speed multiplier for replay mode (default: 1.0)",
+    )
+    p.add_argument(
         "--replay",
         default=None,
         metavar="JSON_FILE",
@@ -1308,6 +1500,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # -- Resolve data directory ---------------------------------------------
+    if args.data_dir:
+        data_dir = args.data_dir
+    else:
+        data_dir = os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "training_data",
+                args.batch,
+                "validated_simPhysics",
+            )
+        )
 
     # -- Parse supply pose --------------------------------------------------
     if args.supply_xyz is not None:
@@ -1332,11 +1538,21 @@ def main() -> None:
     if HAVE_ROS2:
         rclpy.init()
         if mode == MODE_REAL:
-            node = EGMClient()  # type: ignore[name-defined]
-            print("[construct] EGMClient ready (real robot mode).")
+            node = EGMClient(
+                max_velocity_scaling=args.speed_real,
+                max_acceleration_scaling=args.speed_real,
+            )  # type: ignore[name-defined]
+            print(f"[construct] EGMClient ready (real mode, speed={args.speed_real}).")
         else:
-            node = PlanAndExecuteClient(mode=mode)  # type: ignore[name-defined]
-            print("[construct] PlanAndExecuteClient ready.")
+            v_scale = args.speed_sim if mode == MODE_SIM else 0.2
+            node = PlanAndExecuteClient(
+                mode=mode,
+                max_velocity_scaling=v_scale,
+                max_acceleration_scaling=v_scale,
+            )  # type: ignore[name-defined]
+            print(
+                f"[construct] PlanAndExecuteClient ready (mode={mode}, speed={v_scale})."
+            )
         print(f"[construct] Mode: {mode}")
     else:
         print(
@@ -1350,7 +1566,7 @@ def main() -> None:
     # Structure: <root>/<batch>/validated_simPhysics/<demo>  →
     #            <root>/<batch>/validated_simPhysics_robot/<demo>
     robot_dir = os.path.join(
-        os.path.dirname(os.path.abspath(args.data_dir)),
+        os.path.dirname(os.path.abspath(data_dir)),
         "validated_simPhysics_robot",
     )
 
@@ -1364,7 +1580,7 @@ def main() -> None:
             print(f"[replay] ERROR: sequence file not found: {replay_path}")
             sys.exit(1)
         try:
-            run_replay(node, replay_path, mode=mode)
+            run_replay(node, replay_path, mode=mode, speed_replay=args.speed_replay)
         finally:
             if node is not None:
                 for _ in range(60):
@@ -1375,7 +1591,15 @@ def main() -> None:
         return
 
     # -- Planning mode: load demo sequence and plan --------------------------
-    demo_poses = load_demo_sequence(args.demo, args.data_dir)
+    demo_poses = load_demo_sequence(args.demo, data_dir)
+
+    # Apply vertical offset to all bricks if requested
+    if args.structure_z_offset != 0.0:
+        print(
+            f"[construct] Applying vertical offset of {args.structure_z_offset:.4f}m to all bricks."
+        )
+        for pose in demo_poses:
+            pose[2] += args.structure_z_offset
 
     # In non-sim modes, clear any leftover MoveIt collision objects.
     # (In sim mode _gz_clean_scene() handles this inside run_construction.)

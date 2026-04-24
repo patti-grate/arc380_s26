@@ -35,8 +35,14 @@ _COLLISION_OBJECT_QOS = QoSProfile(
 
 
 class EGMClient(Node):
-    def __init__(self):
+    def __init__(
+        self, 
+        max_velocity_scaling: float = 0.2, 
+        max_acceleration_scaling: float = 0.2
+    ):
         super().__init__("egm_client")
+        self._max_velocity_scaling = max_velocity_scaling
+        self._max_acceleration_scaling = max_acceleration_scaling
         self.set_parameters([Parameter("use_sim_time", value=True)])
 
         # MoveIt planning service
@@ -181,8 +187,8 @@ class EGMClient(Node):
         ori_tolerance_rpy: tuple[float, float, float] = (0.001, 0.001, 0.001),
         allowed_planning_time: float = 5.0,
         num_attempts: int = 5,
-        max_velocity_scaling: float = 0.2,
-        max_acceleration_scaling: float = 0.2,
+        max_velocity_scaling: float | None = None,
+        max_acceleration_scaling: float | None = None,
         planner_id: str = "",
     ) -> Optional[RobotTrajectory]:
         mpr = MotionPlanRequest()
@@ -214,8 +220,12 @@ class EGMClient(Node):
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)
-        mpr.max_velocity_scaling_factor = float(max_velocity_scaling)
-        mpr.max_acceleration_scaling_factor = float(max_acceleration_scaling)
+
+        v_scale = max_velocity_scaling if max_velocity_scaling is not None else self._max_velocity_scaling
+        a_scale = max_acceleration_scaling if max_acceleration_scaling is not None else self._max_acceleration_scaling
+
+        mpr.max_velocity_scaling_factor = float(v_scale)
+        mpr.max_acceleration_scaling_factor = float(a_scale)
 
         return self._call_motion_plan(mpr)
 
@@ -229,8 +239,8 @@ class EGMClient(Node):
         tolerance: float = 1e-3,
         allowed_planning_time: float = 2.0,
         num_attempts: int = 3,
-        max_velocity_scaling: float = 1.0,
-        max_acceleration_scaling: float = 1.0,
+        max_velocity_scaling: float | None = None,
+        max_acceleration_scaling: float | None = None,
         planner_id: str = "",
     ) -> Optional[RobotTrajectory]:
         """
@@ -266,8 +276,12 @@ class EGMClient(Node):
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)
-        mpr.max_velocity_scaling_factor = float(max_velocity_scaling)
-        mpr.max_acceleration_scaling_factor = float(max_acceleration_scaling)
+
+        v_scale = max_velocity_scaling if max_velocity_scaling is not None else self._max_velocity_scaling
+        a_scale = max_acceleration_scaling if max_acceleration_scaling is not None else self._max_acceleration_scaling
+
+        mpr.max_velocity_scaling_factor = float(v_scale)
+        mpr.max_acceleration_scaling_factor = float(a_scale)
 
         return self._call_motion_plan(mpr)
 

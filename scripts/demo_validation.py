@@ -3,6 +3,7 @@ import glob
 import json
 import time
 import random
+import argparse
 import numpy as np
 
 import rhino3dm
@@ -13,7 +14,7 @@ from pose_conversion import Brick
 try:
     import rclpy
     from rclpy.node import Node
-    from ros_gz_interfaces.srv import SpawnEntity, ControlWorld
+    from ros_gz_interfaces.srv import SpawnEntity, ControlWorld, DeleteEntity
     from ros_gz_interfaces.msg import WorldControl, WorldReset
     from std_srvs.srv import Empty
 
@@ -56,6 +57,9 @@ class DemoValidator:
     def check_stability(self, initial_states):
         return True
 
+    def fetch_latest_poses_from_gz(self):
+        pass
+
     def destroy_node(self):
         pass
 
@@ -75,8 +79,10 @@ if HAVE_ROS2:
             # Spin up internal temporary ros_gz_bridges
             import subprocess
 
-            self.control_bridge = subprocess.Popen(
-                "ros2 run ros_gz_bridge parameter_bridge /world/irb120_workcell/control@ros_gz_interfaces/srv/ControlWorld",
+            self.bridges = subprocess.Popen(
+                "ros2 run ros_gz_bridge parameter_bridge "
+                "/world/irb120_workcell/control@ros_gz_interfaces/srv/ControlWorld "
+                "/world/irb120_workcell/remove@ros_gz_interfaces/srv/DeleteEntity",
                 shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -84,6 +90,9 @@ if HAVE_ROS2:
 
             self.reset_client = self.create_client(
                 ControlWorld, "/world/irb120_workcell/control"
+            )
+            self.remove_client = self.create_client(
+                DeleteEntity, "/world/irb120_workcell/remove"
             )
             sdf_path = os.path.join(
                 os.getcwd(), "src", "abb_irb120_gazebo", "models", "brick", "model.sdf"
@@ -105,6 +114,7 @@ if HAVE_ROS2:
                     text=True,
                     timeout=2.0,
                 )
+                self.current_model_states.clear()
                 poses = output.split("pose {")
                 for pose_str in poses:
                     if "name:" not in pose_str:
@@ -156,30 +166,45 @@ if HAVE_ROS2:
             )
             import subprocess
 
-            # Purge the original 20 bricks that respawn upon reset
-            for i in range(25):
-                name = f"brick_{i:02d}"
-                cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
-                subprocess.run(
-                    cmd,
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            # Try up to 3 times to ensure the scene is clean
+            for clean_attempt in range(3):
+                self.fetch_latest_poses_from_gz()
+                names_to_remove = [f"brick_{i:02d}" for i in range(25)]
+                names_to_remove += list(self.current_model_states.keys())
+                names_to_remove = list(set(names_to_remove)) # unique
+                
+                if not names_to_remove:
+                    break # Clean!
 
-            # Purge any remaining tracked demo bricks locally
-            for name in list(self.current_model_states.keys()):
-                cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
-                subprocess.run(
-                    cmd,
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                # Use the bridged service for speed
+                if self.remove_client.wait_for_service(timeout_sec=2.0):
+                    futures = []
+                    for name in names_to_remove:
+                        req = DeleteEntity.Request()
+                        req.entity.name = name
+                        req.entity.type = 2 # MODEL
+                        futures.append(self.remove_client.call_async(req))
+                    
+                    if futures:
+                        rclpy.spin_until_future_complete(self, futures[-1], timeout_sec=2.0)
+                else:
+                    self.get_logger().warn("Could not find bridged DeleteEntity service to remove bricks. Falling back to slow subprocess.")
+                    for name in names_to_remove:
+                        cmd = f"gz service -s /world/irb120_workcell/remove --reqtype gz.msgs.Entity --reptype gz.msgs.Boolean --timeout 500 --req 'name: \"{name}\" type: MODEL'"
+                        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                time.sleep(0.5)
+
+            # Final verification
+            self.fetch_latest_poses_from_gz()
+            if self.current_model_states:
+                self.get_logger().error(f"Failed to fully clean scene! Remaining bricks: {list(self.current_model_states.keys())}")
+            else:
+                self.get_logger().info("Scene verified clean.")
 
             self.clear_collapse_message()
             self.current_model_states.clear()
-            time.sleep(1)
+            time.sleep(0.5)
             return True
 
         def spawn_brick(self, name, pose_7d):
@@ -246,8 +271,8 @@ if HAVE_ROS2:
             return True
 
         def destroy_node(self):
-            if hasattr(self, "control_bridge"):
-                self.control_bridge.terminate()
+            if hasattr(self, "bridges"):
+                self.bridges.terminate()
             super().destroy_node()
 
 
@@ -320,14 +345,19 @@ def shuffle_layers(layers):
     return shuffled
 
 
-def main(args=None):
+def main():
+    p = argparse.ArgumentParser(description="Validate Rhino .3dm demos for stability in Gazebo.")
+    p.add_argument("--batch", default="batch0", help="Batch folder in training_data/ (default: batch0)")
+    p.add_argument("--demo", default=None, help="Specific demo name (e.g. demo_01). If omitted, validates all.")
+    args = p.parse_args()
+
     if HAVE_ROS2:
-        rclpy.init(args=args)
+        rclpy.init()
         validator = DemoValidatorNode()
     else:
         validator = DemoValidator()
 
-    batch_dir = os.path.join(os.getcwd(), "training_data", "batch0")
+    batch_dir = os.path.join(os.getcwd(), "training_data", args.batch)
     rhino_dir = os.path.join(batch_dir, "rhino")
     val_dir = os.path.join(batch_dir, "validated_simPhysics")
 
@@ -336,89 +366,161 @@ def main(args=None):
         # create mock to run through logic if user just tests
         os.makedirs(rhino_dir, exist_ok=True)
 
-    demo_files = glob.glob(os.path.join(rhino_dir, "demo_*.3dm"))
+    if args.demo:
+        demo_files = [os.path.join(rhino_dir, f"{args.demo}.3dm")]
+    else:
+        demo_files = glob.glob(os.path.join(rhino_dir, "demo_*.3dm"))
+
     if not demo_files:
-        print("No demo_*.3dm files found to process.")
+        print(f"No demo files found in {rhino_dir}.")
 
-    for demo_file in demo_files:
-        demo_name = os.path.splitext(os.path.basename(demo_file))[0]
-        print(f"\n== Processing {demo_name} ==")
+    try:
+        for demo_file in demo_files:
+            demo_name = os.path.splitext(os.path.basename(demo_file))[0]
+            print(f"\n== Processing {demo_name} ==")
 
-        bricks = extract_poses_from_3dm(demo_file)
-        if not bricks:
-            print(f"No bricks geometry found in {demo_name}.")
-            continue
+            bricks = extract_poses_from_3dm(demo_file)
+            if not bricks:
+                print(f"No bricks geometry found in {demo_name}.")
+                continue
 
-        print(f"Extracted {len(bricks)} bricks.")
-        layers = bucket_and_sort_bricks(bricks)
+            print(f"Extracted {len(bricks)} bricks.")
+            layers = bucket_and_sort_bricks(bricks)
 
-        max_attempts = 4  # 1 original + 3 resamples
-        success = False
-        final_sequence = []
-
-        for attempt in range(max_attempts):
-            print(f"--> Attempt {attempt + 1}/{max_attempts} ...")
-            sequence = shuffle_layers(layers) if attempt > 0 else sum(layers, [])
+            max_attempts = 4  # 1 original + 3 resamples
+            success = True
+            final_sequence = []
+            brick_counter = 0
 
             validator.reset_world()
 
-            stable = True
-            initial_states = {}
-            for i, brick in enumerate(sequence):
-                name = f"{demo_name}_brick_{i}"
-                pose_7d = brick.get_7d_pose()
-
-                if not validator.spawn_brick(name, pose_7d):
-                    print(f"Failed to physically spawn {name}")
-
-                if HAVE_ROS2:
-                    # Sleep for 2 seconds to simulate physics settle (we no longer spin ros bridges)
-                    time.sleep(2.0)
-                else:
-                    time.sleep(0.1)  # Mock wait
-
-                # Snapshot initial resting pose
+            for layer_idx, layer in enumerate(layers):
+                layer_success = False
+                
+                # Snapshot foundation before trying this layer
                 validator.fetch_latest_poses_from_gz()
-                if name in validator.current_model_states:
-                    initial_states[name] = validator.current_model_states[name]
+                foundation_states = validator.current_model_states.copy()
 
-                # Check for structural failure
-                if not validator.check_stability(initial_states):
-                    stable = False
-                    print(f"Collapse detected upon triggering {name}!")
+                for attempt in range(max_attempts):
+                    print(f"--> Layer {layer_idx+1}/{len(layers)}, Attempt {attempt + 1}/{max_attempts} ...")
+                    current_layer_bricks = random.sample(layer, len(layer)) if attempt > 0 else layer
+
+                    stable = True
+                    layer_initial_states = foundation_states.copy()
+                    spawned_in_attempt = []
+
+                    for brick in current_layer_bricks:
+                        name = f"{demo_name}_brick_{brick_counter + len(spawned_in_attempt)}"
+                        pose_7d = brick.get_7d_pose()
+
+                        if not validator.spawn_brick(name, pose_7d):
+                            print(f"Failed to physically spawn {name}")
+
+                        spawned_in_attempt.append((name, brick))
+
+                        if HAVE_ROS2:
+                            time.sleep(2.0)
+                        else:
+                            time.sleep(0.1)  # Mock wait
+
+                        # Snapshot initial resting pose
+                        validator.fetch_latest_poses_from_gz()
+                        if name in validator.current_model_states:
+                            layer_initial_states[name] = validator.current_model_states[name]
+
+                        # Check for structural failure
+                        if not validator.check_stability(layer_initial_states):
+                            stable = False
+                            print(f"Collapse detected upon triggering {name}!")
+                            break
+
+                    if stable:
+                        layer_success = True
+                        final_sequence.extend([b for n, b in spawned_in_attempt])
+                        brick_counter += len(spawned_in_attempt)
+                        print(f"Layer {layer_idx+1} stabilized.")
+                        break
+                    else:
+                        # Attempt failed. Check if foundation is still intact.
+                        validator.fetch_latest_poses_from_gz()
+                        foundation_intact = True
+                        for fn_name, fn_pose in foundation_states.items():
+                            if fn_name not in validator.current_model_states:
+                                foundation_intact = False
+                                break
+                            curr_pose = validator.current_model_states[fn_name]
+                            dx = curr_pose.position.x - fn_pose.position.x
+                            dy = curr_pose.position.y - fn_pose.position.y
+                            dz = curr_pose.position.z - fn_pose.position.z
+                            dist = (dx**2 + dy**2 + dz**2)**0.5
+                            if dist > 0.05:
+                                foundation_intact = False
+                                break
+                        
+                        if foundation_intact and attempt < max_attempts - 1:
+                            print("Foundation intact. Fast-resetting layer...")
+                            names_to_remove = [n for n, b in spawned_in_attempt]
+                            if validator.remove_client and validator.remove_client.wait_for_service(timeout_sec=1.0):
+                                futures = []
+                                from ros_gz_interfaces.srv import DeleteEntity
+                                for n in names_to_remove:
+                                    req = DeleteEntity.Request()
+                                    req.entity.name = n
+                                    req.entity.type = 2
+                                    futures.append(validator.remove_client.call_async(req))
+                                if futures:
+                                    rclpy.spin_until_future_complete(validator, futures[-1], timeout_sec=2.0)
+                            time.sleep(1.0)
+                            # Verify fast reset
+                            validator.fetch_latest_poses_from_gz()
+                        elif attempt < max_attempts - 1:
+                            print("Foundation ruined! Full rebuild required.")
+                            validator.reset_world()
+                            for i, b in enumerate(final_sequence):
+                                fn_name = f"{demo_name}_brick_{i}"
+                                validator.spawn_brick(fn_name, b.get_7d_pose())
+                                if HAVE_ROS2: time.sleep(1.0) # Faster spawn for known good foundation
+                            validator.fetch_latest_poses_from_gz()
+                            foundation_states = validator.current_model_states.copy()
+                            time.sleep(1.0)
+
+                if not layer_success:
+                    print(f"Failed to stabilize Layer {layer_idx+1}. Validation failed.")
+                    success = False
                     break
 
-            if stable:
-                success = True
-                final_sequence = sequence
+            if success:
                 print(f"Successfully stabilized and sequenced {demo_name}.")
-                break
 
-        # Export files
-        out_base = os.path.join(val_dir, demo_name)
-        os.makedirs(os.path.join(out_base, "7d_sequence"), exist_ok=True)
-        os.makedirs(os.path.join(out_base, "5d_sequence"), exist_ok=True)
+            # Export files
+            out_base = os.path.join(val_dir, demo_name)
+            os.makedirs(os.path.join(out_base, "7d_sequence"), exist_ok=True)
+            os.makedirs(os.path.join(out_base, "5d_sequence"), exist_ok=True)
 
-        if success:
-            seq_7d = [b.get_7d_pose().tolist() for b in final_sequence]
-            seq_5d = []
-            for b in final_sequence:
-                p5 = b.to_5d_pose()
-                seq_5d.append({"error": p5} if isinstance(p5, str) else p5.tolist())
+            if success:
+                seq_7d = [b.get_7d_pose().tolist() for b in final_sequence]
+                seq_5d = []
+                for b in final_sequence:
+                    p5 = b.to_5d_pose()
+                    seq_5d.append({"error": p5} if isinstance(p5, str) else p5.tolist())
 
-            with open(os.path.join(out_base, "7d_sequence", "sequence.json"), "w") as f:
-                json.dump(seq_7d, f, indent=2)
-            with open(os.path.join(out_base, "5d_sequence", "sequence.json"), "w") as f:
-                json.dump(seq_5d, f, indent=2)
-        else:
-            with open(os.path.join(out_base, "failure.json"), "w") as f:
-                json.dump(
-                    {"error": "Structure collapsed after 3 resampling attempts."}, f
-                )
-
-    validator.destroy_node()
-    if HAVE_ROS2:
-        rclpy.shutdown()
+                with open(os.path.join(out_base, "7d_sequence", "sequence.json"), "w") as f:
+                    json.dump(seq_7d, f, indent=2)
+                with open(os.path.join(out_base, "5d_sequence", "sequence.json"), "w") as f:
+                    json.dump(seq_5d, f, indent=2)
+            else:
+                with open(os.path.join(out_base, "failure.json"), "w") as f:
+                    json.dump(
+                        {"error": "Structure collapsed after 3 resampling attempts."}, f
+                    )
+    except KeyboardInterrupt:
+        print("\nValidation interrupted by user. Shutting down...")
+    except Exception as e:
+        print(f"\nError during validation: {e}")
+    finally:
+        validator.destroy_node()
+        if HAVE_ROS2:
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

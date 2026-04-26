@@ -73,7 +73,7 @@ The `construct_using_validated.py` script orchestrates the phased pick-and-place
 
 **Plan and Execute in Simulation:**
 ```bash
-python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0 --sim
+python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0 --sim --structure-z-offset 0.004
 ```
 
 **Replay a Pre-planned Sequence (Fast):**
@@ -112,7 +112,7 @@ Sequences are stored hierarchically in `training_data/`:
 
 1.  **Phased Planning**: Pick-and-place is divided into `hover_supply`, `grasp_supply`, `lift_supply`, `hover_goal`, `place_goal`, `retract_goal`, and `return_home`.
 2.  **Wrist Locking**: Joint 4 and 6 are locked during vertical plunges and lifts (`lock_wrist=True`) to ensure stability.
-3.  **Grasp Fallbacks**: If a preferred grasp fails due to collision, the orchestrator automatically iterates through all 4 grasp orientations and supply-side flips.
+3.  **Grasp Fallbacks**: If a preferred grasp fails due to collision, the orchestrator automatically iterates through all 3 grasp orientations and 4 brick pose flips.
 4.  **Safe Home Baseline**: The robot returns to a consistent `SAFE_HOME` configuration between every brick to ensure deterministic planning starting points.
 
 ---

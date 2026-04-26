@@ -205,7 +205,7 @@ _RHINO_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "sr
 T_GRASP_OFFSETS, GRASP_ORDER = _load_dynamic_grasps(_RHINO_PATH)
 
 # Default supply pallet pose -- x, y, z (flat brick, no rotation for now)
-DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, -0.40, 0.030)
+DEFAULT_SUPPLY_XYZ: tuple[float, float, float] = (-0.20, 0.40, 0.030)
 DEFAULT_SUPPLY_QUAT_XYZW: tuple[float, float, float, float] = (
     0.0,
     0.0,
@@ -226,7 +226,7 @@ SAFE_HOME_NAMES: list[str] = [
     "joint_5",
     "joint_6",
 ]
-SAFE_HOME_POSITIONS: list[float] = [-1.57, 0.00, 0.00, 0.00, 1.57, 1.57]
+SAFE_HOME_POSITIONS: list[float] = [1.57, 0.00, 0.00, 0.00, 1.57, 1.57]
 
 # Gazebo SDF path for bricks (used in --sim mode for visual spawning)
 _SDF_PATH = os.path.normpath(
@@ -370,10 +370,11 @@ def _gz_clean_scene(node: "PlanAndExecuteClient | None") -> None:
     print("[gz]   Removing pre-existing brick_00..brick_24...")
     bricks_to_remove = [f"brick_{i:02d}" for i in range(25)]
 
-    # Step 2: purge our own construct_brick_* and supply_brick_gz
+    # Step 2: purge our own construct_brick_*, supply_brick_gz, and any stale grip weld
     names = _gz_fetch_model_names()
     to_remove = [
-        n for n in names if n.startswith("construct_brick_") or n == _SUPPLY_GZ_NAME
+        n for n in names
+        if n.startswith("construct_brick_") or n == _SUPPLY_GZ_NAME or n == "grip_weld"
     ]
     bricks_to_remove.extend(to_remove)
 
@@ -924,9 +925,9 @@ def execute_brick_sequence(
     # 3. Close gripper
     if not dry_run:
         time.sleep(0.2)
-        node.send_gripper_command(position=0.01, max_velocity=0.05)
+        node.send_gripper_command(position=0.004, max_velocity=0.03)
     if not dry_run:
-        time.sleep(0.5)
+        time.sleep(1.0)  # allow contact forces to fully settle before lifting
 
     # 4. Lift out from supply
     if not _exec("lift_supply", plans[2]):
@@ -1343,8 +1344,8 @@ def run_replay(
                     print(f"    [dry] execute {label}")
             elif stype == "gripper":
                 if not dry_run and node is not None:
-                    pos = 0.01 if step["action"] == "close" else 0.0
-                    node.send_gripper_command(position=pos, max_velocity=0.05)
+                    pos = 0.004 if step["action"] == "close" else 0.0
+                    node.send_gripper_command(position=pos, max_velocity=0.03)
                     if step["action"] == "close":
                         time.sleep(0.1)  # brief settle before lift
                 else:

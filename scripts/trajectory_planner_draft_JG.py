@@ -7,9 +7,20 @@ import sys
 import time
 import tty
 import termios
+import subprocess
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+import math
+_ARM_JOINT_LIMITS: dict[str, tuple[float, float]] = {
+    "joint_1": (math.radians(-165), math.radians(165)),
+    "joint_2": (math.radians(-110), math.radians(110)),
+    "joint_3": (math.radians(-110), math.radians(70)),
+    "joint_4": (math.radians(-160), math.radians(160)),
+    "joint_5": (math.radians(-120), math.radians(120)),
+    "joint_6": (math.radians(-400), math.radians(400)),
+}
 
 from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import JointState
@@ -75,7 +86,16 @@ class PlanAndExecuteClient(Node):
         max_velocity_scaling: float = 0.2,
         max_acceleration_scaling: float = 0.2,
     ):
-        super().__init__("trajectory_planner_draft")
+        super().__init__(
+            "trajectory_planner_draft",
+            parameter_overrides=[
+                rclpy.parameter.Parameter(
+                    "use_sim_time",
+                    rclpy.parameter.Parameter.Type.BOOL,
+                    mode == "sim",
+                )
+            ],
+        )
         self._mode = mode
         self._max_velocity_scaling = max_velocity_scaling
         self._max_acceleration_scaling = max_acceleration_scaling
@@ -154,6 +174,7 @@ class PlanAndExecuteClient(Node):
         self._attached_object_pub = self.create_publisher(
             AttachedCollisionObject, "/attached_collision_object", _COLLISION_OBJECT_QOS
         )
+
 
     @property
     def tcp_link(self) -> str:
@@ -510,6 +531,22 @@ class PlanAndExecuteClient(Node):
         jc.weight = float(weight)
         return jc
 
+    def _validate_joint_limits(self, traj: "RobotTrajectory") -> bool:
+        """Return False if any waypoint in traj violates the arm joint limits."""
+        jt = traj.joint_trajectory
+        for i, pt in enumerate(jt.points):
+            for name, pos in zip(jt.joint_names, pt.positions):
+                if name not in _ARM_JOINT_LIMITS:
+                    continue
+                lo, hi = _ARM_JOINT_LIMITS[name]
+                if pos < lo - 1e-4 or pos > hi + 1e-4:
+                    self.get_logger().error(
+                        f"Trajectory rejected: waypoint {i} {name}={pos:.4f} rad "
+                        f"violates limits [{lo:.4f}, {hi:.4f}]"
+                    )
+                    return False
+        return True
+
     def _call_motion_plan(self, mpr: MotionPlanRequest) -> Optional[RobotTrajectory]:
         req = GetMotionPlan.Request()
         req.motion_plan_request = mpr
@@ -546,6 +583,8 @@ class PlanAndExecuteClient(Node):
             self.get_logger().info("Last configuration:")
             for n, p in zip(jt.joint_names, last.positions):
                 self.get_logger().info(f"  {n}: {p:.6f}")
+        if not self._validate_joint_limits(traj):
+            return None
         return traj
 
     def check_ik(
@@ -798,9 +837,10 @@ class PlanAndExecuteClient(Node):
             self.get_logger().warn(
                 f"Cartesian path only planned {res.fraction * 100:.1f}%"
             )
-            if res.fraction < 0.5:
-                return None
+            return None
 
+        if not self._validate_joint_limits(res.solution):
+            return None
         return res.solution
 
     def plan_gripper_to_joint_positions(

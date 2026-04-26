@@ -12,6 +12,7 @@ x-ros2-common: &ros2-common
     - ../workshops:/workshops
     - ../scripts:/scripts
     - ../src:/ros2_ws/src
+    - ../src/abb_irb120_description/urdf/gripper_macro.xacro:/ros2_ws/install/abb_irb120_description/share/abb_irb120_description/urdf/gripper_macro.xacro
 
   environment:
     - DISPLAY=:1
@@ -44,6 +45,8 @@ services:
       - ../src:/ros2_ws/src
       - ../src/abb_irb120_gazebo/launch/gz_moveit.launch.py:/ros2_ws/install/abb_irb120_gazebo/share/abb_irb120_gazebo/launch/gz_moveit.launch.py
       - ../src/abb_irb120_gazebo/worlds/validation_workcell.sdf:/ros2_ws/install/abb_irb120_gazebo/share/abb_irb120_gazebo/worlds/validation_workcell.sdf
+      - ../src/abb_irb120_description/urdf/gripper_macro.xacro:/ros2_ws/install/abb_irb120_description/share/abb_irb120_description/urdf/gripper_macro.xacro
+      - ../src/abb_irb120_gazebo/abb_irb120_gazebo/simulation_reset_node.py:/ros2_ws/install/abb_irb120_gazebo/lib/abb_irb120_gazebo/simulation_reset_node
     # no command override, so entrypoint.sh runs simulation by default
 
   ros2_real:

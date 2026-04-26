@@ -44,7 +44,7 @@ class SimulationResetNode(Node):
         self.declare_parameter("world_name", "irb120_workcell")
         self.declare_parameter("robot_name", "abb_irb120")
         self.declare_parameter("robot_description_topic", "robot_description")
-        self.declare_parameter("hw_ready_timeout_sec", 15.0)
+        self.declare_parameter("hw_ready_timeout_sec", 45.0)
 
         self.world_name = self.get_parameter("world_name").value
         self.robot_name = self.get_parameter("robot_name").value
@@ -107,7 +107,7 @@ class SimulationResetNode(Node):
             self.get_logger().error(f"  {msg}")
             errors.append(msg)
 
-        time.sleep(0.5)
+        time.sleep(2.0)
 
         # 3. Respawn the robot.
         self.get_logger().info("[3/5] Respawning robot...")
@@ -117,7 +117,7 @@ class SimulationResetNode(Node):
                 "-name", self.robot_name,
                 "-topic", self.robot_description_topic,
             ],
-            timeout=15,
+            timeout=45,
         )
         if ok:
             self.get_logger().info(f"  Robot respawned: {out}")

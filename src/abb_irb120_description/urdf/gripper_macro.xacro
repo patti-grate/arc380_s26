@@ -66,8 +66,8 @@
     </link>
 
     <gazebo reference="${prefix}left_finger">
-      <mu1>20.0</mu1>
-      <mu2>20.0</mu2>
+      <mu1>1000.0</mu1>
+      <mu2>1000.0</mu2>
       <kp>1000000000.0</kp>
       <kd>1000000.0</kd>
       <maxVel>0.01</maxVel>
@@ -75,8 +75,8 @@
     </gazebo>
 
     <gazebo reference="${prefix}right_finger">
-      <mu1>20.0</mu1>
-      <mu2>20.0</mu2>
+      <mu1>1000.0</mu1>
+      <mu2>1000.0</mu2>
       <kp>1000000000.0</kp>
       <kd>1000000.0</kd>
       <maxVel>0.01</maxVel>
@@ -88,7 +88,7 @@
         <child link="${prefix}left_finger"/>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <axis xyz="0 -1 0"/>
-        <limit lower="-0.001" upper="0.025" effort="1000" velocity="0.05"/>
+        <limit lower="-0.001" upper="0.025" effort="5000" velocity="0.05"/>
         <dynamics damping="1.0" friction="0.1"/>
     </joint>
 
@@ -98,18 +98,9 @@
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <axis xyz="0 1 0"/>
         <mimic joint="${prefix}left_finger_joint" multiplier="1.0" offset="0.0"/>
-        <limit lower="-0.001" upper="0.025" effort="1000" velocity="0.05"/>
+        <limit lower="-0.001" upper="0.025" effort="5000" velocity="0.05"/>
         <dynamics damping="1.0" friction="0.1"/>
     </joint>
-
-    <gazebo>
-      <plugin filename="gz-sim-mimic-system" name="gz::sim::systems::Mimic">
-        <joint>left_finger_joint</joint>
-        <mimic_joint>right_finger_joint</mimic_joint>
-        <multiplier>1.0</multiplier>
-        <offset>0.0</offset>
-      </plugin>
-    </gazebo>
 
     <link name="${prefix}gripper_tcp"/>
     <joint name="${prefix}gripper_base-gripper_tcp" type="fixed">

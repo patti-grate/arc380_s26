@@ -12,11 +12,12 @@ from moveit_msgs.msg import (
     JointConstraint,
     MotionPlanRequest,
     OrientationConstraint,
+    PlanningSceneComponents,
     PositionConstraint,
     RobotState,
     RobotTrajectory,
 )
-from moveit_msgs.srv import GetMotionPlan
+from moveit_msgs.srv import GetMotionPlan, GetPlanningScene
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -59,6 +60,11 @@ class EGMClient(Node):
         # MoveIt planning scene publisher (used to register collision objects)
         self._collision_object_pub = self.create_publisher(
             CollisionObject, "/collision_object", _COLLISION_OBJECT_QOS
+        )
+
+        # Planning scene query service (used by remove_all_world_collision_objects)
+        self._get_planning_scene_cli = self.create_client(
+            GetPlanningScene, "/get_planning_scene"
         )
 
     @staticmethod
@@ -333,6 +339,72 @@ class EGMClient(Node):
             for _ in range(3):
                 rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.04)
+
+    def remove_scene_object(self, object_id: str, frame_id: str = "world") -> None:
+        """Remove a single planning-scene collision object by id."""
+        co = CollisionObject()
+        co.header.frame_id = frame_id
+        co.id = object_id
+        co.operation = CollisionObject.REMOVE
+
+        for _ in range(300):
+            if self._collision_object_pub.get_subscription_count() > 0:
+                break
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        for _ in range(25):
+            co.header.stamp = self.get_clock().now().to_msg()
+            self._collision_object_pub.publish(co)
+            for _ in range(3):
+                rclpy.spin_once(self, timeout_sec=0.02)
+            time.sleep(0.04)
+
+        self.get_logger().info(f"CollisionObject REMOVE id={object_id!r}")
+
+    def remove_all_world_collision_objects(
+        self, service_timeout_sec: float = 5.0
+    ) -> int:
+        """
+        Query MoveIt for all world collision objects and publish REMOVE for each.
+        Returns the number of objects removed.
+        """
+        if not self._get_planning_scene_cli.wait_for_service(
+            timeout_sec=service_timeout_sec
+        ):
+            self.get_logger().warn(
+                "/get_planning_scene not available; skipping collision-object clear."
+            )
+            return 0
+
+        req = GetPlanningScene.Request()
+        req.components = PlanningSceneComponents()
+        req.components.components = (
+            PlanningSceneComponents.WORLD_OBJECT_NAMES
+            | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+        )
+
+        fut = self._get_planning_scene_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        if fut.result() is None:
+            self.get_logger().error("GetPlanningScene service call returned no result.")
+            return 0
+
+        scene = fut.result().scene
+        id_to_frame: dict[str, str] = {}
+        for co in scene.world.collision_objects:
+            oid = (co.id or "").strip()
+            if not oid:
+                continue
+            fid = (co.header.frame_id or "").strip() or "world"
+            id_to_frame.setdefault(oid, fid)
+
+        for oid, fid in id_to_frame.items():
+            self.remove_scene_object(oid, frame_id=fid)
+
+        self.get_logger().info(
+            f"Cleared {len(id_to_frame)} world collision object(s)."
+        )
+        return len(id_to_frame)
 
     def replay_arm_trajectory(self, robot_traj: RobotTrajectory) -> bool:
         """Replay a pre-planned RobotTrajectory via EGM (same path as live execution)."""

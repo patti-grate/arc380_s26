@@ -69,6 +69,11 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-insta
     "rhino3dm" \
     "opencv-contrib-python-headless"
 
+# PyTorch CPU-only (no GPU in this container)
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    torch \
+    --index-url https://download.pytorch.org/whl/cpu
+
 
 FROM base AS workspace
 

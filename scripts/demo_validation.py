@@ -4,6 +4,7 @@ import json
 import time
 import random
 import argparse
+from typing import Any
 import numpy as np
 
 import rhino3dm
@@ -27,6 +28,36 @@ except ImportError:
     print(
         "WARNING: rclpy or ROS 2 packages not found. Script will run in dry-run/mock mode."
     )
+
+# ── MoveIt reachability imports ───────────────────────────────────────────
+HAVE_MOVEIT = False
+_MoveitClient: Any = None
+T_GRASP_OFFSETS: dict = {}
+GRASP_ORDER: list = []
+apply_grasp_offset: Any = None
+apply_local_rotation: Any = None
+is_standing_brick: Any = None
+BRICK_SIZE_XYZ: tuple = (0.051, 0.023, 0.014)
+SAFE_HOME_NAMES: list = []
+SAFE_HOME_POSITIONS: list = []
+try:
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from construct_using_validated import (
+        T_GRASP_OFFSETS,
+        GRASP_ORDER,
+        apply_grasp_offset,
+        apply_local_rotation,
+        is_standing_brick,
+        BRICK_SIZE_XYZ,
+        SAFE_HOME_NAMES,
+        SAFE_HOME_POSITIONS,
+    )
+    if HAVE_ROS2:
+        from trajectory_planner_draft_JG import PlanAndExecuteClient as _MoveitClient
+        HAVE_MOVEIT = True
+except ImportError as _e:
+    print(f"WARNING: Reachability checking unavailable: {_e}")
 
 
 class DemoValidator:
@@ -276,6 +307,56 @@ if HAVE_ROS2:
             super().destroy_node()
 
 
+def check_placement_reachable(moveit_node, goal_7d: np.ndarray) -> "np.ndarray | None":
+    """
+    Return the effective placement pose (a flip of goal_7d) for the first
+    (grasp × flip) combination that is joint-feasible and collision-free,
+    so that Gazebo and MoveIt both see the brick in the orientation the robot
+    will actually use.  Returns None if no combination works.
+    Falls back to goal_7d when MoveIt is unavailable (optimistic pass-through).
+    """
+    if moveit_node is None or not T_GRASP_OFFSETS:
+        return goal_7d
+
+    # Mirror construct_using_validated exactly:
+    #   standing bricks → 8 x-rotations × 2 z-rotations = 16 flip variants
+    #   laying bricks   → 2 x-rotations × 2 z-rotations =  4 flip variants
+    # Preferred grasps are tried first, then all remaining grasps in GRASP_ORDER.
+    is_standing = is_standing_brick(goal_7d)
+    x_angles = [0, 90, 180, 270, 45, 135, 225, 315] if is_standing else [0, 180]
+    z_angles = [0, 180]
+    preferred = ["grasp1", "grasp2"] if is_standing else ["grasp3", "grasp1", "grasp2"]
+    grasps_to_try = preferred + [g for g in GRASP_ORDER if g not in preferred]
+
+    for grasp_id in grasps_to_try:
+        if grasp_id not in T_GRASP_OFFSETS:
+            continue
+        T_rel = T_GRASP_OFFSETS[grasp_id]
+        for rz in z_angles:
+            for rx in x_angles:
+                flipped_7d = apply_local_rotation(goal_7d, rx, 0, rz)
+                goal_tcp_xyz, goal_tcp_quat = apply_grasp_offset(flipped_7d, T_rel)
+                # Fast joint-limit check (no collision)
+                if not moveit_node.check_ik(
+                    "arm", moveit_node.tcp_link, "world",
+                    goal_tcp_xyz, goal_tcp_quat,
+                    start_joint_names=SAFE_HOME_NAMES,
+                    start_joint_positions=SAFE_HOME_POSITIONS,
+                    avoid_collisions=False,
+                ):
+                    continue
+                # Collision check at the placement state
+                if moveit_node.check_ik(
+                    "arm", moveit_node.tcp_link, "world",
+                    goal_tcp_xyz, goal_tcp_quat,
+                    start_joint_names=SAFE_HOME_NAMES,
+                    start_joint_positions=SAFE_HOME_POSITIONS,
+                    avoid_collisions=True,
+                ):
+                    return flipped_7d
+    return None
+
+
 def extract_poses_from_3dm(filepath):
     model = rhino3dm.File3dm.Read(filepath)
     if not model:
@@ -345,10 +426,49 @@ def shuffle_layers(layers):
     return shuffled
 
 
+def centroid_sort_layer(layer: list) -> list:
+    """
+    Return the layer sorted by XY distance to a randomly sampled centroid.
+
+    Attempt 0 returns the original order unchanged.  For subsequent attempts
+    a centroid is drawn uniformly from the XY bounding box of all brick
+    positions, then bricks are ordered by distance to it.  The direction
+    (nearest-first or farthest-first) is also chosen at random, giving a
+    different deterministic ordering each attempt without pure random shuffles.
+    """
+    positions = np.array([b.get_7d_pose()[:2] for b in layer])  # Nx2 XY
+    min_xy = positions.min(axis=0)
+    max_xy = positions.max(axis=0)
+
+    # Sample uniformly from the four edges of the bounding box by arc length.
+    w = float(max_xy[0] - min_xy[0])
+    h = float(max_xy[1] - min_xy[1])
+    perimeter = 2 * (w + h)
+    t = random.uniform(0, perimeter)
+    if t < w:                        # bottom edge
+        centroid = np.array([float(min_xy[0]) + t, float(min_xy[1])])
+    elif t < w + h:                  # right edge
+        centroid = np.array([float(max_xy[0]), float(min_xy[1]) + (t - w)])
+    elif t < 2 * w + h:              # top edge
+        centroid = np.array([float(max_xy[0]) - (t - w - h), float(max_xy[1])])
+    else:                            # left edge
+        centroid = np.array([float(min_xy[0]), float(max_xy[1]) - (t - 2 * w - h)])
+
+    distances = np.linalg.norm(positions - centroid, axis=1)
+    reverse = random.random() < 0.5
+    sorted_indices = np.argsort(distances)
+    if reverse:
+        sorted_indices = sorted_indices[::-1]
+
+    return [layer[i] for i in sorted_indices]
+
+
 def main():
     p = argparse.ArgumentParser(description="Validate Rhino .3dm demos for stability in Gazebo.")
     p.add_argument("--batch", default="batch0", help="Batch folder in training_data/ (default: batch0)")
     p.add_argument("--demo", default=None, help="Specific demo name (e.g. demo_01). If omitted, validates all.")
+    p.add_argument("--no-reachability-check", action="store_true", default=False,
+                   help="Skip MoveIt reachability validation (use when MoveIt is not running).")
     args = p.parse_args()
 
     if HAVE_ROS2:
@@ -356,6 +476,18 @@ def main():
         validator = DemoValidatorNode()
     else:
         validator = DemoValidator()
+
+    moveit_node = None
+    if HAVE_MOVEIT and not args.no_reachability_check:
+        print("Initializing MoveIt reachability checker (requires MoveIt running)...")
+        moveit_node = _MoveitClient(mode="sim")
+        moveit_node.publish_scene_box(
+            object_id="table_surface",
+            frame_id="world",
+            size_xyz=(2.0, 2.0, 0.02),
+            position_xyz=(0.0, 0.0, -0.02),
+        )
+        print("MoveIt reachability checker ready.")
 
     batch_dir = os.path.join(os.getcwd(), "training_data", args.batch)
     rhino_dir = os.path.join(batch_dir, "rhino")
@@ -387,12 +519,20 @@ def main():
             print(f"Extracted {len(bricks)} bricks.")
             layers = bucket_and_sort_bricks(bricks)
 
-            max_attempts = 4  # 1 original + 3 resamples
+            max_attempts = 10  # 1 original + 9 reshuffled orderings
             success = True
             final_sequence = []
             brick_counter = 0
 
             validator.reset_world()
+            if moveit_node is not None:
+                moveit_node.remove_all_world_collision_objects()
+                moveit_node.publish_scene_box(
+                    object_id="table_surface",
+                    frame_id="world",
+                    size_xyz=(2.0, 2.0, 0.02),
+                    position_xyz=(0.0, 0.0, -0.02),
+                )
 
             for layer_idx, layer in enumerate(layers):
                 layer_success = False
@@ -403,20 +543,28 @@ def main():
 
                 for attempt in range(max_attempts):
                     print(f"--> Layer {layer_idx+1}/{len(layers)}, Attempt {attempt + 1}/{max_attempts} ...")
-                    current_layer_bricks = random.sample(layer, len(layer)) if attempt > 0 else layer
+                    current_layer_bricks = centroid_sort_layer(layer)
 
                     stable = True
                     layer_initial_states = foundation_states.copy()
                     spawned_in_attempt = []
+                    current_attempt_moveit_ids: list = []
 
                     for brick in current_layer_bricks:
                         name = f"{demo_name}_brick_{brick_counter + len(spawned_in_attempt)}"
                         pose_7d = brick.get_7d_pose()
 
-                        if not validator.spawn_brick(name, pose_7d):
+                        # Returns the effective (possibly flipped) pose, or None if unreachable.
+                        effective_pose = check_placement_reachable(moveit_node, pose_7d)
+                        if effective_pose is None:
+                            print(f"  [reach] No reachable grasp for {name}, treating as unreachable.")
+                            stable = False
+                            break
+
+                        if not validator.spawn_brick(name, effective_pose):
                             print(f"Failed to physically spawn {name}")
 
-                        spawned_in_attempt.append((name, brick))
+                        spawned_in_attempt.append((name, effective_pose))
 
                         if HAVE_ROS2:
                             time.sleep(2.0)
@@ -434,13 +582,33 @@ def main():
                             print(f"Collapse detected upon triggering {name}!")
                             break
 
+                        # Register brick in MoveIt so subsequent bricks' reachability
+                        # checks treat it as an obstacle.
+                        if moveit_node is not None:
+                            mv_id = f"mv_{name}"
+                            moveit_node.publish_scene_box(
+                                object_id=mv_id,
+                                frame_id="world",
+                                size_xyz=BRICK_SIZE_XYZ,
+                                position_xyz=tuple(float(v) for v in effective_pose[:3]),
+                                quat_xyzw=tuple(float(v) for v in effective_pose[3:]),
+                            )
+                            current_attempt_moveit_ids.append(mv_id)
+
                     if stable:
                         layer_success = True
-                        final_sequence.extend([b for n, b in spawned_in_attempt])
+                        final_sequence.extend([p for n, p in spawned_in_attempt])
                         brick_counter += len(spawned_in_attempt)
+                        current_attempt_moveit_ids = []  # keep MoveIt objects for future layers
                         print(f"Layer {layer_idx+1} stabilized.")
                         break
                     else:
+                        # Remove this attempt's MoveIt collision objects before retrying.
+                        if moveit_node is not None:
+                            for mid in current_attempt_moveit_ids:
+                                moveit_node.remove_scene_object(mid)
+                        current_attempt_moveit_ids = []
+
                         # Attempt failed. Check if foundation is still intact.
                         validator.fetch_latest_poses_from_gz()
                         foundation_intact = True
@@ -459,7 +627,7 @@ def main():
                         
                         if foundation_intact and attempt < max_attempts - 1:
                             print("Foundation intact. Fast-resetting layer...")
-                            names_to_remove = [n for n, b in spawned_in_attempt]
+                            names_to_remove = [n for n, _ in spawned_in_attempt]
                             if validator.remove_client and validator.remove_client.wait_for_service(timeout_sec=1.0):
                                 futures = []
                                 from ros_gz_interfaces.srv import DeleteEntity
@@ -476,10 +644,26 @@ def main():
                         elif attempt < max_attempts - 1:
                             print("Foundation ruined! Full rebuild required.")
                             validator.reset_world()
-                            for i, b in enumerate(final_sequence):
+                            if moveit_node is not None:
+                                moveit_node.remove_all_world_collision_objects()
+                                moveit_node.publish_scene_box(
+                                    object_id="table_surface",
+                                    frame_id="world",
+                                    size_xyz=(2.0, 2.0, 0.02),
+                                    position_xyz=(0.0, 0.0, -0.02),
+                                )
+                            for i, fn_pose_7d in enumerate(final_sequence):
                                 fn_name = f"{demo_name}_brick_{i}"
-                                validator.spawn_brick(fn_name, b.get_7d_pose())
+                                validator.spawn_brick(fn_name, fn_pose_7d)
                                 if HAVE_ROS2: time.sleep(1.0) # Faster spawn for known good foundation
+                                if moveit_node is not None:
+                                    moveit_node.publish_scene_box(
+                                        object_id=f"mv_{fn_name}",
+                                        frame_id="world",
+                                        size_xyz=BRICK_SIZE_XYZ,
+                                        position_xyz=tuple(float(v) for v in fn_pose_7d[:3]),
+                                        quat_xyzw=tuple(float(v) for v in fn_pose_7d[3:]),
+                                    )
                             validator.fetch_latest_poses_from_gz()
                             foundation_states = validator.current_model_states.copy()
                             time.sleep(1.0)
@@ -498,10 +682,10 @@ def main():
             os.makedirs(os.path.join(out_base, "5d_sequence"), exist_ok=True)
 
             if success:
-                seq_7d = [b.get_7d_pose().tolist() for b in final_sequence]
+                seq_7d = [p.tolist() for p in final_sequence]
                 seq_5d = []
-                for b in final_sequence:
-                    p5 = b.to_5d_pose()
+                for p in final_sequence:
+                    p5 = Brick(pose_7d=p).to_5d_pose()
                     seq_5d.append({"error": p5} if isinstance(p5, str) else p5.tolist())
 
                 with open(os.path.join(out_base, "7d_sequence", "sequence.json"), "w") as f:
@@ -518,6 +702,8 @@ def main():
     except Exception as e:
         print(f"\nError during validation: {e}")
     finally:
+        if moveit_node is not None:
+            moveit_node.destroy_node()
         validator.destroy_node()
         if HAVE_ROS2:
             rclpy.shutdown()

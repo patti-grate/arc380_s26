@@ -311,7 +311,7 @@ def _gz_get_pose(name: str):
         pass
     return None
 
-def _gz_remove_batch(brick_names: list[str]) -> None:
+def _gz_remove_batch(brick_names: list[str], settle_sec: float = 1.0) -> None:
     """Remove a list of named models from Gazebo in parallel."""
     processes = []
     for name in brick_names:
@@ -330,11 +330,12 @@ def _gz_remove_batch(brick_names: list[str]) -> None:
     for p in processes:
         p.wait()
 
-    # Shorter settle time
-    time.sleep(1.0)
+    if settle_sec > 0:
+        time.sleep(settle_sec)
 
 
 _SUPPLY_GZ_NAME = "supply_brick_gz"  # Gazebo model name for the feeding brick
+_PLACED_STRUCTURE_NAME = "placed_structure"  # single static model consolidating all placed bricks
 
 
 def _gz_fetch_model_names() -> list[str]:
@@ -374,13 +375,14 @@ def _gz_clean_scene(node: "PlanAndExecuteClient | None") -> None:
     names = _gz_fetch_model_names()
     to_remove = [
         n for n in names
-        if n.startswith("construct_brick_") or n == _SUPPLY_GZ_NAME or n == "grip_weld"
+        if n.startswith("construct_brick_") or n in (_SUPPLY_GZ_NAME, _PLACED_STRUCTURE_NAME, "grip_weld")
     ]
     bricks_to_remove.extend(to_remove)
 
     if node is not None:
         print("[gz]   Calling Gazebo Reset service...")
-        node.reset_gazebo_simulation()
+        # Use a short timeout so we fail fast when simulation_reset_node isn't running
+        node.reset_gazebo_simulation(service_wait_sec=5.0)
         time.sleep(1.0)
 
         if bricks_to_remove:
@@ -389,8 +391,8 @@ def _gz_clean_scene(node: "PlanAndExecuteClient | None") -> None:
             )
             _gz_remove_batch(bricks_to_remove)
 
-        # Briefly wait for the physics engine to settle
-        time.sleep(0.5)
+        # Give controllers time to settle after model removals / robot respawn
+        time.sleep(3.0)
     else:
         print("[gz]   Calling Gazebo Reset service via subprocess...")
         subprocess.run(
@@ -409,6 +411,83 @@ def _gz_clean_scene(node: "PlanAndExecuteClient | None") -> None:
         node.remove_all_world_collision_objects()
 
     print("[gz] Scene cleanup complete.")
+
+
+def _gz_spawn_static_structure(placed_poses: list[np.ndarray]) -> None:
+    """
+    Spawn (or replace) a single static Gazebo model containing all placed
+    bricks as individual links.  Replaces the previous placed_structure model
+    so Gazebo only tracks one rigid body regardless of brick count.
+    """
+    # Remove the previous version and wait for Gazebo to commit the removal
+    # before issuing the spawn.  With settle_sec=0 the spawn request can arrive
+    # while Gazebo is still processing the deletion and will be rejected.
+    _gz_remove_batch([_PLACED_STRUCTURE_NAME], settle_sec=0.5)
+    if not placed_poses:
+        return
+
+    w, h, d = BRICK_SIZE_XYZ
+    links_sdf = ""
+    for i, pose_7d in enumerate(placed_poses):
+        x, y, z = float(pose_7d[0]), float(pose_7d[1]), float(pose_7d[2])
+        roll, pitch, yaw = R.from_quat(pose_7d[3:7]).as_euler("xyz")
+        links_sdf += (
+            f'<link name="b{i:03d}">'
+            f"<pose>{x:.6f} {y:.6f} {z:.6f} {roll:.6f} {pitch:.6f} {yaw:.6f}</pose>"
+            f'<collision name="c"><geometry><box><size>{w} {h} {d}</size></box></geometry></collision>'
+            f'<visual name="v">'
+            f"<geometry><box><size>{w} {h} {d}</size></box></geometry>"
+            f"<material><ambient>0.76 0.45 0.18 1</ambient><diffuse>0.76 0.45 0.18 1</diffuse></material>"
+            f"</visual></link>"
+        )
+    sdf_str = (
+        '<?xml version="1.0"?>'
+        '<sdf version="1.8">'
+        f'<model name="{_PLACED_STRUCTURE_NAME}">'
+        "<static>true</static>"
+        f"{links_sdf}"
+        "</model></sdf>"
+    )
+
+    # Use a fixed, well-known path so Gazebo's file-loader can always find it.
+    # Random NamedTemporaryFile paths have caused load failures when Gazebo
+    # reads the file asynchronously after the service call returns.
+    sdf_path = "/tmp/placed_structure.sdf"
+    with open(sdf_path, "w") as _f:
+        _f.write(sdf_str)
+
+    # Source ROS so that 'gz' is on PATH in the subprocess environment,
+    # matching the pattern used in _gz_remove_batch.
+    req = f'sdf_filename: \\"{sdf_path}\\"'
+    cmd = (
+        f"source /opt/ros/jazzy/setup.bash && "
+        f"gz service -s /world/{_WORLD_NAME}/create "
+        f"--reqtype gz.msgs.EntityFactory --reptype gz.msgs.Boolean "
+        f'--timeout 5000 --req "{req}"'
+    )
+
+    for attempt in range(3):
+        result = subprocess.run(
+            cmd, shell=True, executable="/bin/bash", capture_output=True, text=True
+        )
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        if result.returncode == 0:
+            print(
+                f"  [gz] placed_structure spawned OK "
+                f"({len(placed_poses)} brick(s)) — {stdout or 'no output'}"
+            )
+            # Give Gazebo a moment to finish loading the entity before the
+            # next command (e.g. supply brick spawn for the next brick).
+            time.sleep(0.5)
+            return
+        print(
+            f"  [gz] Static structure spawn failed (attempt {attempt + 1}/3): "
+            f"rc={result.returncode} stderr={stderr[:200]}"
+        )
+        time.sleep(1.0 + attempt)  # back-off before retry
+
+    print("  [gz] WARNING: placed_structure could not be spawned after 3 attempts.")
 
 
 # ===========================================================================
@@ -990,6 +1069,7 @@ def run_construction(
     placed_count = 0
     failed_bricks: list[int] = []
     spawned_gz_names: list[str] = []  # tracked for potential cleanup
+    placed_gz_poses: list[np.ndarray] = []  # settled poses for static structure (sim only)
     export_sequence: list[dict] = []  # filled when export_dir is set
 
     print(f"\n[construct] Starting construction -- {len(demo_poses)} bricks")
@@ -1019,24 +1099,33 @@ def run_construction(
         print(
             "[construct] Physically aligning to SAFE_HOME to initialize geometric baseline..."
         )
-        init_traj = node.plan_gripper_to_joint_positions(
-            group_name="arm",
-            goal_joint_names=SAFE_HOME_NAMES,
-            goal_joint_positions=SAFE_HOME_POSITIONS,
-            start_joint_names=None,
-            start_joint_positions=None,
-            tolerance=0.08,
-            allowed_planning_time=10.0,
-            num_attempts=5,
-        )
-        if init_traj:
-            node.execute_moveit_trajectory(init_traj)
-            # Make sure gripper is open initially
-            node.send_gripper_command(position=0.011, max_velocity=0.05)
-        else:
-            print(
-                "[WARN] Initialization move to SAFE_HOME failed. First trajectory might reject!"
+        homed = False
+        for home_attempt in range(5):
+            init_traj = node.plan_gripper_to_joint_positions(
+                group_name="arm",
+                goal_joint_names=SAFE_HOME_NAMES,
+                goal_joint_positions=SAFE_HOME_POSITIONS,
+                start_joint_names=None,
+                start_joint_positions=None,
+                tolerance=0.08,
+                allowed_planning_time=10.0,
+                num_attempts=5,
             )
+            if not init_traj:
+                print(f"[construct][WARN] SAFE_HOME plan failed (attempt {home_attempt + 1}/5).")
+                break
+            ok = node.execute_moveit_trajectory(init_traj)
+            if ok:
+                node.send_gripper_command(position=0.011, max_velocity=0.05)
+                homed = True
+                break
+            print(
+                f"[construct][WARN] Homing execution rejected (attempt {home_attempt + 1}/5), "
+                "waiting 3s for controllers to recover..."
+            )
+            time.sleep(3.0)
+        if not homed:
+            print("[construct][WARN] Could not home robot; first trajectory might reject.")
 
     # Override supply z for real mode: physical bricks sit higher than sim model.
     effective_supply_xyz = supply_xyz
@@ -1192,8 +1281,22 @@ def run_construction(
             )
             print(f"  [scene] Added collision object '{brick_obj_id}'")
 
-        # Optional: rest slightly
-        if not (mode == MODE_DRY_RUN):
+        # In sim mode: wait 2 s for the brick to settle after the gripper
+        # opens, then consolidate it into a single static model so Gazebo only
+        # simulates one rigid body regardless of brick count.
+        # NOTE: _gz_get_pose(gz_name) returns the SUPPLY/FEED position because
+        # the Gazebo brick model has no physical weld to the gripper and never
+        # moves.  We use best_goal_7d (the planner's target) as the authoritative
+        # placed position so the structure is correctly built at the goal.
+        if mode == MODE_SIM:
+            print("  [gz] Waiting 2 s for brick to settle before consolidating...")
+            time.sleep(2.0)
+            _gz_remove_batch([gz_name], settle_sec=0.0)
+            placed_gz_poses.append(best_goal_7d)
+            _gz_spawn_static_structure(placed_gz_poses)
+            print(f"  [gz] Static structure updated ({len(placed_gz_poses)} brick(s))")
+        elif not (mode == MODE_DRY_RUN):
+            # Non-sim real-execution: brief rest before next brick
             time.sleep(1.0)
 
     # -- Export ------------------------------------------------------------
@@ -1266,25 +1369,39 @@ def run_replay(
     # before running, and routing through EGM requires RAPID to be in the EGM motion segment)
     if node is not None and not dry_run and mode != MODE_REAL:
         print("[replay] Homing to SAFE_HOME before replay...")
-        init_traj = node.plan_gripper_to_joint_positions(
-            group_name="arm",
-            goal_joint_names=SAFE_HOME_NAMES,
-            goal_joint_positions=SAFE_HOME_POSITIONS,
-            tolerance=0.08,
-            allowed_planning_time=10.0,
-            num_attempts=5,
-        )
-        if init_traj:
-            node.execute_moveit_trajectory(init_traj)
-            node.send_gripper_command(position=0.011, max_velocity=0.05)
-        else:
-            print("[replay][WARN] SAFE_HOME init failed; first execution may reject.")
+        homed = False
+        for home_attempt in range(5):
+            init_traj = node.plan_gripper_to_joint_positions(
+                group_name="arm",
+                goal_joint_names=SAFE_HOME_NAMES,
+                goal_joint_positions=SAFE_HOME_POSITIONS,
+                tolerance=0.08,
+                allowed_planning_time=10.0,
+                num_attempts=5,
+            )
+            if not init_traj:
+                print(f"[replay][WARN] SAFE_HOME plan failed (attempt {home_attempt + 1}/5).")
+                break
+            ok = node.execute_moveit_trajectory(init_traj)
+            if ok:
+                node.send_gripper_command(position=0.011, max_velocity=0.05)
+                homed = True
+                break
+            print(
+                f"[replay][WARN] Homing execution rejected (attempt {home_attempt + 1}/5), "
+                "waiting 3s for controllers to recover..."
+            )
+            time.sleep(3.0)
+        if not homed:
+            print("[replay][WARN] Could not home robot; first execution may reject.")
     elif mode == MODE_REAL:
         print(
             "[replay] Real mode: skipping SAFE_HOME init — position robot manually before replay."
         )
 
     print(f"\n[replay] Starting replay -- mode={mode}\n")
+
+    placed_gz_poses: list[np.ndarray] = []  # settled poses for static structure (sim only)
 
     for brick_data in bricks:
         brick_idx = brick_data["brick_idx"]
@@ -1295,15 +1412,17 @@ def run_replay(
 
         gz_name = f"construct_brick_{brick_idx:03d}"
         supply_7d = np.array(brick_data["supply_7d"])
+        goal_7d = np.array(brick_data["goal_7d"])
         gz_spawned = False
+        gripper_just_opened = False  # tracks when the gripper releases the brick
 
         for step in brick_data["steps"]:
             stype = step["type"]
             if stype == "traj":
                 label = step.get("label", "?")
 
-                # Spawn the Gazebo brick just before the arm descends to grasp,
-                # mirroring the timing used in execute_brick_sequence.
+                # Spawn the Gazebo supply brick just before the arm descends to
+                # grasp, mirroring the timing used in execute_brick_sequence.
                 if label == "grasp_supply" and mode == MODE_SIM and not gz_spawned:
                     _gz_spawn(gz_name, supply_7d)
                     gz_spawned = True
@@ -1315,7 +1434,6 @@ def run_replay(
                         traj = _apply_j6_offset(traj, REAL_GRIPPER_J6_OFFSET_RAD)
 
                     if speed_replay != 1.0:
-                        # Scale the time and velocities in the trajectory
                         jt = traj.joint_trajectory
                         for pt in jt.points:
                             t_total = (
@@ -1327,36 +1445,50 @@ def run_replay(
                             pt.time_from_start.nanosec = int(
                                 (t_scaled - int(t_scaled)) * 1e9
                             )
-
-                            # Scale velocities and accelerations
                             pt.velocities = [v * speed_replay for v in pt.velocities]
                             pt.accelerations = [
                                 a * (speed_replay**2) for a in pt.accelerations
                             ]
 
                     print(f"    [replay] executing {label} (speed={speed_replay}x)")
-                    ok = node.execute_moveit_trajectory(traj)
+                    # Use replay_arm_trajectory (FollowJointTrajectory directly to
+                    # the arm controller) instead of execute_moveit_trajectory
+                    # (MoveIt /execute_trajectory action).  The MoveIt executor
+                    # validates the trajectory's first waypoint against the live
+                    # robot state and rejects with CONTROL_FAILED (-4) whenever
+                    # there is any start-state mismatch from the pre-planned
+                    # trajectory.  replay_arm_trajectory bypasses that check in
+                    # sim mode while the real-mode EGM path is unchanged.
+                    if mode == MODE_REAL:
+                        ok = node.execute_moveit_trajectory(traj)
+                    else:
+                        ok = node.replay_arm_trajectory(traj)
                     if not ok:
                         print(
                             f"    [replay][WARN] {label} controller rejected — skipping"
                         )
                 else:
                     print(f"    [dry] execute {label}")
+
             elif stype == "gripper":
                 if not dry_run and node is not None:
                     pos = 0.004 if step["action"] == "close" else 0.0
                     node.send_gripper_command(position=pos, max_velocity=0.03)
                     if step["action"] == "close":
                         time.sleep(0.1)  # brief settle before lift
+                    elif step["action"] == "open":
+                        # Track the moment the gripper releases the brick so we
+                        # can trigger the 2-second settle + consolidation below.
+                        gripper_just_opened = True
                 else:
                     print(f"    [dry] gripper {step['action']}")
+
             elif stype == "sleep":
                 if not dry_run:
                     time.sleep(step["sec"])
 
         # Re-register the placed brick in MoveIt for execution safety
         if node is not None:
-            goal_7d = np.array(brick_data["goal_7d"])
             node.publish_scene_box(
                 object_id=f"placed_brick_{brick_idx:03d}",
                 frame_id="world",
@@ -1366,7 +1498,21 @@ def run_replay(
             )
             print(f"  [scene] registered placed_brick_{brick_idx:03d}")
 
-        if not dry_run:
+        # In sim mode: wait 2 s after the gripper opened so the brick settles
+        # under physics, then consolidate all placed bricks into a single static
+        # model.  This keeps Gazebo's physics load constant regardless of how
+        # many bricks have been placed.
+        # NOTE: The supply brick (gz_name) was spawned at the feed and never
+        # physically moves in Gazebo (no gripper weld).  Always use goal_7d as
+        # the authoritative placed position so the structure appears at the goal.
+        if mode == MODE_SIM and not dry_run:
+            print("  [gz] Waiting 2 s for brick to settle before consolidating...")
+            time.sleep(2.0)
+            _gz_remove_batch([gz_name], settle_sec=0.0)
+            placed_gz_poses.append(goal_7d)
+            _gz_spawn_static_structure(placed_gz_poses)
+            print(f"  [gz] Static structure updated ({len(placed_gz_poses)} brick(s))")
+        elif not dry_run:
             time.sleep(1.0)
 
     print(f"\n[replay] Complete -- {len(bricks)} bricks executed.")

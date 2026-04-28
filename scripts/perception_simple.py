@@ -1,7 +1,12 @@
 import numpy as np
 import cv2
 from cv2 import aruco
-from matplotlib import pyplot as plt
+try:
+    from matplotlib import pyplot as plt
+    _HAVE_PLT = True
+except Exception:
+    _HAVE_PLT = False
+
 #import rclpy
 #from rclpy import geometry_msgs
 import numpy as np 
@@ -186,9 +191,14 @@ selected_contour = contours[closest_area_idx]
 cv2.drawContours(selected_contour_img, contours, -1, (0,255,0), 3)
 
 
-plt.figure()
-plt.imshow(selected_contour_img)
-plt.show()
+if _HAVE_PLT:
+    try:
+        plt.figure()
+        plt.imshow(selected_contour_img)
+        plt.show()
+    except Exception:
+        pass
+
 
 rect = cv2.minAreaRect(selected_contour) # minAreaRect returns a Box2D structure. A Box2D structure is a tuple of ((x, y), (w, h), angle).
 center = rect[0]
@@ -239,10 +249,15 @@ block_position = [x_center, y_center, z]
 print(block_orientation_tuple)
 print(block_position)
 
-plt.imshow(cv2.cvtColor(selected_contour_img, cv2.COLOR_BGR2RGB))
-plt.title(f'Pose of the blue square')
-plt.gca().invert_yaxis()
-plt.show()
+if _HAVE_PLT:
+    try:
+        plt.imshow(cv2.cvtColor(selected_contour_img, cv2.COLOR_BGR2RGB))
+        plt.title(f'Pose of the blue square')
+        plt.gca().invert_yaxis()
+        plt.show()
+    except Exception:
+        pass
+
 
 print(_ids)
 print(np.argsort(_ids))

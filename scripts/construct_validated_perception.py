@@ -1292,6 +1292,13 @@ def run_construction(
             else:
                 print("  [gz] Warning: Could not query resting pose, using default.")
 
+        # Initialise per-brick planning state
+        best_plans    = None
+        best_goal_7d  = None
+        best_supply_7d = None
+        best_desc     = None
+        best_grasp_id = None
+
         # Try preferred grasps first, then fallback to all 3 if needed
         grasps_to_try = active_grasps + [
             g for g in GRASP_ORDER if g not in active_grasps

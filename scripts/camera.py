@@ -306,6 +306,11 @@ def main() -> int:
 
     try:
         server.start()
+        
+        cap = RealSenseCaptureServer.capture_frame(server)
+        server.write_response(1, cap[0], cap[1])
+        
+
         server.serve_forever()
         return 0
     except Exception as e:
@@ -316,6 +321,8 @@ def main() -> int:
             server.stop()
         except Exception:
             pass
+
+
 
 
 if __name__ == "__main__":

@@ -567,6 +567,42 @@ def load_demo_sequence(
     with open(seq_path) as f:
         raw = json.load(f)
     poses = [np.array(p, dtype=float) for p in raw]
+
+    # seq_path_supply = os.path.join(data_dir, demo_name, "7d_sequence", "supply.json")
+    # if not os.path.isfile(seq_path_supply):
+    #     raise FileNotFoundError(
+    #         f"Validated sequence not found: {seq_path_supply}\n"
+    #         f"Run demo_validation.py first to generate validated sequences."
+    #     )
+    # with open(seq_path_supply) as f_s:
+    #     raw = json.load(f_s)
+
+    # pose_supply = [np.array(p, dtype=float) for p in raw]
+    # poses = pose_supply + poses
+    print(f"[construct] Loaded {len(poses)} bricks from {seq_path}")
+    return poses
+
+def load_supply(
+    supply_dir: str,
+    data_dir: str,
+) -> list[np.ndarray]:
+    """
+    Load a validated 7D brick sequence from disk.
+
+    Returns a list of np.ndarray, each [x, y, z, qx, qy, qz, qw].
+    Looks for:
+      <data_dir>/supply_dir/7d_sequence/supply.json
+    """
+    seq_path = os.path.join(data_dir, supply_dir, "7d_sequence", "supply.json")
+    if not os.path.isfile(seq_path):
+        raise FileNotFoundError(
+            f"Validated sequence not found: {seq_path}\n"
+            f"Run demo_validation.py first to generate validated sequences."
+        )
+    with open(seq_path) as f:
+        raw = json.load(f)
+    poses = [np.array(p, dtype=float) for p in raw]
+
     print(f"[construct] Loaded {len(poses)} bricks from {seq_path}")
     return poses
 

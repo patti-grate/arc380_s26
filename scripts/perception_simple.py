@@ -142,7 +142,7 @@ block = np.array([54,59,29])
 distances = np.linalg.norm(centers - block, axis=1)
 block_cluster_label = np.argmin(distances)
 
-mask_img = np.zeros(kmeans_img.shape[:block_cluster_label], dtype='uint8')
+mask_img = np.zeros(kmeans_img.shape[:2], dtype='uint8')
 mask_img[labels == block_cluster_label] = 255
 
 
@@ -182,23 +182,30 @@ angle_rad = np.deg2rad(angle)
 #7.25in + y
 #2in + x
 
-x_0 = aruco_corners[2][3][0] # our frame's x = 0, y = 700 
-y_0 = aruco_corners[0][0][1]
-x_center = x_0 + ((rect[0][0]  / ppi) * inches2metres)
-y_center = y_0 + (((rect[0][0] + rect[0][1]) / ppi) * inches2metres) 
+# Image pixel (0,0) corresponds to marker 0 corner 0 (top-left of the working area)
+# Image pixel (width*ppi, 0) corresponds to marker 3 corner 0 (top-right)
+# Image pixel (0, height*ppi) corresponds to marker 1 corner 0 (bottom-left)
+# Pixel axes: +col → robot +x direction, +row → robot +y direction
+# Origin in robot frame is marker 0, corner 0
+x_origin = aruco_corners[0][0][0]  # robot x at image pixel col=0
+y_origin = aruco_corners[0][0][1]  # robot y at image pixel row=0
 
-# x_center = (corners[0][0] - corners[0][1]) / 2 + corners[0][0]
-# y_center = (corners[0][0] - corners[1][0]) / 2 + corners[0][0]
-z = 0.15 # dummy center of block value
+# Scale factors: total robot-frame span divided by total pixel span
+x_span_m = aruco_corners[3][0][0] - aruco_corners[0][0][0]  # marker3_TL.x - marker0_TL.x
+y_span_m = aruco_corners[1][0][1] - aruco_corners[0][0][1]  # marker1_TL.y - marker0_TL.y
+x_m_per_px = x_span_m / (width * ppi)
+y_m_per_px = y_span_m / (height * ppi)
 
-block_orientation_tuple = []
-#block_orientation_tuple.setRPY(0, 0, angle_rad) # assuming only rotations about the z-axis
+# rect[0] = (pixel_col, pixel_row) of the brick centre
+px_col, px_row = rect[0]
+x_center = x_origin + px_col * x_m_per_px
+y_center = y_origin + px_row * y_m_per_px
+z = 0.030  # flat brick on table-top (matches REAL_SUPPLY_Z / DEFAULT_SUPPLY_XYZ in construct_using_validated.py)
 
-#assume no rotation around z 
-block_orientation_tuple = quaternion_from_euler(np.cos(angle_rad), np.sin(angle_rad), 0)
-
+# Brick orientation: rotation about Z-axis only
+block_orientation_tuple = quaternion_from_euler(0, 0, angle_rad)
 block_orientation_tuple = block_orientation_tuple / np.linalg.norm(block_orientation_tuple)
-block_position = [x_center, y_center, .015]
+block_position = [x_center, y_center, z]
 print(block_orientation_tuple)
 print(block_position)
 

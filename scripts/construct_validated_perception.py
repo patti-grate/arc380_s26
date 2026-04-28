@@ -1,50 +1,45 @@
 """
-construct_using_validated.py
-============================
-Pick-and-place construction script that replays a validated demo sequence
-using the ABB IRB120 robot arm.
+construct_validated_perception.py
+==================================
+Perception-integrated pick-and-place construction script.
+Detects the supply brick pose via camera each cycle, then plans and
+executes brick placement using the ABB IRB120 robot arm.
 
 Workflow
 --------
-1. Load a validated 7D brick sequence (from training_data/batch1/validated_simPhysics).
-2. For each brick in the sequence:
-   a. Try each of the # pre-defined grasping poses (extracted from grasping_poses.3dm).
-   b. For each grasp candidate, plan a full pick-and-place trajectory via
-      trajectory_planner_draft.PlanAndExecuteClient.
-   c. Use the first grasp that plans collision-free for all phases.
-   d. In --dry-run mode: only plan and report; no motion is executed.
-   e. In --real mode: execute via MoveIt (/execute_trajectory action).
-3. After each successful placement, register the placed brick as a collision
-   object so subsequent plans avoid it.
+1. Load a validated 7D brick sequence.
+2. Home the robot to SAFE_HOME.
+3. For each brick:
+   a. Prompt the operator to place a brick in the supply area.
+   b. Call perception_simple.py to capture a frame and detect the brick pose.
+   c. Try grasp candidates; plan collision-free trajectories with MoveIt.
+   d. If planning succeeds, show the plan summary and ask for execution confirmation.
+   e. On confirmation, execute on real robot (or dry-run if no --real flag).
+   f. Register the placed brick as a MoveIt collision object.
 
 Usage (inside Docker with MoveIt running)
 ------------------------------------------
-  # Dry-run (planning only, no execution -- safe to run anywhere):
-  python3 scripts/construct_using_validated.py --demo demo_0
+  # Dry-run (plan only, perception active, no motion):
+  python3 scripts/construct_validated_perception.py --demo demo_0
 
-  # Real robot execution (run ONLY inside ros2_real Docker container):
-  python3 scripts/construct_using_validated.py --demo demo_0 --real
+  # Real robot execution:
+  python3 scripts/construct_validated_perception.py --demo demo_0 --real
 
 CLI arguments
 -------------
-  --demo     : demo name inside validated_simPhysics/ (default: demo_0)
-  --data-dir : override path to validated_simPhysics root
-  --real     : enable real robot execution (default: dry-run)
-  --grasp-id : force a specific grasp (grasp1..grasp6); default tries all
-  --supply-xyz: supply pallet XYZ as "x,y,z" (default: 0.0,0.48,0.030)
-  --hover-z  : additional Z height for pre/post grasp hover in metres (default: 0.12)
+  --demo        : demo name inside validated_simPhysics/ (default: demo_0)
+  --data-dir    : override path to validated_simPhysics root
+  --real        : enable real robot execution (default: dry-run)
+  --grasp-id    : force a specific grasp (grasp1..grasp6); default tries all
+  --hover-z     : additional Z height for pre/post grasp hover in metres (default: 0.12)
+  --skip-perception : use --supply-xyz instead of camera detection
+  --supply-xyz  : fallback supply XYZ when --skip-perception is set
 
-Grasping Poses
---------------
-Extracted from src/grasping_poses/grasping_poses.3dm.
-Each entry is a 4x4 homogeneous matrix T_grasp_in_brick:
-  T_tcp_world = T_brick_world @ T_grasp_in_brick
-
-The brick_pose reference frame in the Rhino model:
-  origin  : [0, 0.42, 0.0315]
-  X-axis  : [+1,  0,  0]   (longest brick dimension)
-  Y-axis  : [ 0, -1,  0]   (medium brick dimension, note flipped)
-  Z-axis  : [ 0,  0, +1]   (shortest brick dimension / vertical)
+Notes on collision/joint checking in real mode
+----------------------------------------------
+MoveIt planning (OMPL + IK + collision scene) runs identically in the real
+container. The planning scene contains the table surface and all previously
+placed bricks, so collision checking is meaningful without Gazebo.
 """
 
 from __future__ import annotations
@@ -1076,6 +1071,55 @@ def execute_brick_sequence(
 
 
 # ===========================================================================
+# Perception helper
+# ===========================================================================
+
+
+def detect_supply_pose(
+    perception_script: str,
+    supply_json: str,
+    fallback_xyz: tuple[float, float, float],
+    fallback_quat: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """
+    Run perception_simple.py as a subprocess, wait for it to write supply.json,
+    then return (xyz, quat_xyzw).  Falls back to the provided defaults on any error.
+    """
+    import subprocess as _sp
+
+    print("[perception] Running camera detection...")
+    try:
+        result = _sp.run(
+            [sys.executable, perception_script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            print(f"[perception] WARNING: script exited {result.returncode}")
+            print(result.stderr[-800:] if result.stderr else "(no stderr)")
+            return fallback_xyz, fallback_quat
+    except Exception as exc:
+        print(f"[perception] ERROR running perception script: {exc}")
+        return fallback_xyz, fallback_quat
+
+    try:
+        with open(supply_json) as _f:
+            data = json.load(_f)
+        xyz = tuple(float(v) for v in data["supply_xyz"])       # type: ignore
+        quat = tuple(float(v) for v in data["supply_quat_xyzw"])  # type: ignore
+        print(
+            f"[perception] Detected supply pose: "
+            f"xyz=({xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f})  "
+            f"quat=({quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f})"
+        )
+        return xyz, quat  # type: ignore
+    except Exception as exc:
+        print(f"[perception] ERROR reading supply.json: {exc}")
+        return fallback_xyz, fallback_quat
+
+
+# ===========================================================================
 # Main construction loop
 # ===========================================================================
 
@@ -1090,16 +1134,20 @@ def run_construction(
     mode: str,
     forced_grasp: Optional[str],
     export_dir: Optional[str] = None,
+    use_perception: bool = True,
+    perception_script: Optional[str] = None,
+    supply_json: Optional[str] = None,
 ) -> None:
     """
-    Iterate through the demo sequence and pick-and-place each brick.
+    Perception-integrated construction loop.
 
     For each brick:
-    - Try grasps in GRASP_ORDER (or only forced_grasp if specified).
-    - Use the first grasp where all planning phases succeed.
-    - Register the successfully placed brick as a MoveIt collision object.
-    - In sim mode, also spawn the placed brick SDF into Gazebo visually.
-    - Log a warning and skip if no grasp succeeds.
+    1. Home robot to SAFE_HOME.
+    2. Prompt operator to place supply brick.
+    3. Run perception to detect supply pose (or use fallback xyz).
+    4. Try all grasp candidates; plan collision-free trajectories.
+    5. On success, ask operator to confirm execution.
+    6. Execute (real / dry-run) and register placed brick as collision object.
     """
 
     placed_count = 0
@@ -1163,24 +1211,56 @@ def run_construction(
         if not homed:
             print("[construct][WARN] Could not home robot; first trajectory might reject.")
 
-    #if real mode, get supply block from camera
-    if mode == MODE_REAL:
-        
+    for brick_idx, original_goal_7d in enumerate(demo_poses):
+        print(f"\n{'=' * 60}")
+        print(f"[construct] -- Brick {brick_idx + 1}/{len(demo_poses)} --")
+        print(f"{'=' * 60}")
 
-    # Override supply z for real mode: physical bricks sit higher than sim model.
-    effective_supply_xyz = supply_xyz
-    if mode == MODE_REAL and supply_xyz[2] != REAL_SUPPLY_Z:
-        effective_supply_xyz = (supply_xyz[0], supply_xyz[1], REAL_SUPPLY_Z)
-    supply_7d_base = np.array([*effective_supply_xyz, *supply_quat_xyzw])
+        # ----------------------------------------------------------------
+        # Step 1: Home the robot between bricks (skip for very first brick
+        # which was already homed above, but home again for safety on real).
+        # ----------------------------------------------------------------
+        if brick_idx > 0 and node is not None and mode in [MODE_SIM, MODE_REAL]:
+            print("[construct] Homing robot before next brick...")
+            home_traj = node.plan_gripper_to_joint_positions(
+                group_name="arm",
+                goal_joint_names=SAFE_HOME_NAMES,
+                goal_joint_positions=SAFE_HOME_POSITIONS,
+                start_joint_names=None,
+                start_joint_positions=None,
+                tolerance=0.08,
+                allowed_planning_time=10.0,
+                num_attempts=5,
+            )
+            if home_traj:
+                node.execute_moveit_trajectory(home_traj)
+            else:
+                print("[construct][WARN] Could not plan home trajectory; continuing anyway.")
 
-    if mode == MODE_REAL:
-        print(
-            f"[construct] Real-mode z corrections active: "
-            f"supply z={effective_supply_xyz[2]:.3f}m, goal z offset={REAL_GOAL_Z_OFFSET_M:+.3f}m"
+        # ----------------------------------------------------------------
+        # Step 2: Prompt operator to place supply brick
+        # ----------------------------------------------------------------
+        input(
+            f"\n[USER] Place brick {brick_idx + 1}/{len(demo_poses)} in the supply area, "
+            f"then press ENTER to capture..."
         )
 
-    for brick_idx, original_goal_7d in enumerate(demo_poses):
-        print(f"\n[construct] -- Brick {brick_idx + 1}/{len(demo_poses)} --")
+        # ----------------------------------------------------------------
+        # Step 3: Detect supply pose via camera (or use fallback)
+        # ----------------------------------------------------------------
+        if use_perception and perception_script and supply_json:
+            detected_xyz, detected_quat = detect_supply_pose(
+                perception_script, supply_json,
+                fallback_xyz=supply_xyz,
+                fallback_quat=supply_quat_xyzw,
+            )
+        else:
+            detected_xyz, detected_quat = supply_xyz, supply_quat_xyzw
+            print(f"[construct] Perception skipped. Using supply_xyz={detected_xyz}")
+
+        # Always use the hardcoded supply Z (brick flat on table)
+        detected_xyz = (detected_xyz[0], detected_xyz[1], REAL_SUPPLY_Z)
+        current_supply_7d = np.array([*detected_xyz, *detected_quat])
 
         # Apply real-robot z correction to the goal placement pose.
         if mode == MODE_REAL and REAL_GOAL_Z_OFFSET_M != 0.0:
@@ -1196,31 +1276,21 @@ def run_construction(
             )
 
         print(
-            f"  [info] Target is {'STANDING' if is_standing else 'LAYING'}. Using grasps: {active_grasps}"
+            f"  [info] Target is {'STANDING' if is_standing else 'LAYING'}. "
+            f"Trying grasps: {active_grasps}"
         )
 
-        best_plans = None
-        best_goal_7d = None
-        best_supply_7d = None
-        best_desc = None
-        best_grasp_id = None
-
+        # Sim-mode: spawn the visual supply brick and wait for physics settle
         gz_name = f"construct_brick_{brick_idx:03d}"
-        current_supply_7d = supply_7d_base.copy()
-
-        # Physics-Based Pickup Pose
         if mode == MODE_SIM:
             _gz_spawn(gz_name, current_supply_7d)
-            # Give Gazebo physics 1.0s to let the brick drop and settle perfectly
-            import time
             time.sleep(1.0)
-            
             settled_pose = _gz_get_pose(gz_name)
             if settled_pose is not None:
                 print(f"  [gz] Physical resting pose acquired: z={settled_pose[2]:.4f}")
                 current_supply_7d = settled_pose
             else:
-                print(f"  [gz] Warning: Could not query resting pose, using default.")
+                print("  [gz] Warning: Could not query resting pose, using default.")
 
         # Try preferred grasps first, then fallback to all 3 if needed
         grasps_to_try = active_grasps + [
@@ -1272,10 +1342,37 @@ def run_construction(
 
         if best_plans is None:
             print(
-                f"  [FAIL] Exhausted all fallback poses and grasps for Brick {brick_idx + 1}. Terminating."
+                f"  [FAIL] Exhausted all fallback poses and grasps for Brick {brick_idx + 1}."
             )
-            failed_bricks.append(brick_idx)
-            break  # Stop construction entirely
+            ans = input("  Skip this brick and continue? [y/N]: ").strip().lower()
+            if ans == "y":
+                failed_bricks.append(brick_idx)
+                continue
+            else:
+                failed_bricks.append(brick_idx)
+                break
+
+        # ----------------------------------------------------------------
+        # Step 4: Confirm execution with operator (real/sim only)
+        # ----------------------------------------------------------------
+        print(
+            f"\n  [PLAN OK] Grasp={best_grasp_id}, Variant={best_desc}"
+            f"\n  Supply: xyz=({best_supply_7d[0]:.4f}, {best_supply_7d[1]:.4f}, {best_supply_7d[2]:.4f})"
+            f"\n  Goal:   xyz=({best_goal_7d[0]:.4f}, {best_goal_7d[1]:.4f}, {best_goal_7d[2]:.4f})"
+        )
+        if mode in [MODE_REAL, MODE_SIM]:
+            confirm = input("  Execute this brick? [y/N/skip/abort]: ").strip().lower()
+            if confirm == "skip":
+                print("  [USER] Skipping brick.")
+                failed_bricks.append(brick_idx)
+                continue
+            elif confirm == "abort":
+                print("  [USER] Aborting construction.")
+                break
+            elif confirm != "y":
+                print("  [USER] Execution declined; skipping brick.")
+                failed_bricks.append(brick_idx)
+                continue
 
         # Execute the cleanly generated plan
         exec_ok = execute_brick_sequence(
@@ -1287,9 +1384,13 @@ def run_construction(
         )
 
         if not exec_ok:
-            print(f"  [FAIL] Plan executed poorly, terminating early.")
+            print(f"  [FAIL] Execution rejected by controller.")
+            ans = input("  Continue to next brick? [y/N]: ").strip().lower()
+            if ans != "y":
+                failed_bricks.append(brick_idx)
+                break
             failed_bricks.append(brick_idx)
-            break
+            continue
 
         placed_count += 1
         if mode == MODE_SIM:
@@ -1682,6 +1783,12 @@ def parse_args() -> argparse.Namespace:
             "loads from <batch>/validated_simPhysics_robot/<demo>/planned_sequence.json."
         ),
     )
+    p.add_argument(
+        "--skip-perception",
+        action="store_true",
+        default=False,
+        help="Disable camera detection; use --supply-xyz as the fixed supply pose.",
+    )
     return p.parse_args()
 
 
@@ -1801,6 +1908,20 @@ def main() -> None:
     else:
         export_dir = os.path.join(robot_dir, args.demo)
 
+    # -- Resolve perception paths ------------------------------------------
+    _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    perception_script = os.path.join(_scripts_dir, "perception_simple.py")
+    # supply.json is written by perception_simple.py to SHARED_DIR
+    try:
+        sys.path.insert(0, _scripts_dir)
+        from camera import SHARED_DIR as _SHARED_DIR  # type: ignore
+        supply_json = str(_SHARED_DIR / "supply.json")
+    except Exception:
+        supply_json = "/realsense_shared/supply.json"  # fallback path
+
+    use_perception = not args.skip_perception
+
+
     try:
         run_construction(
             node,
@@ -1811,6 +1932,9 @@ def main() -> None:
             mode=mode,
             forced_grasp=args.grasp_id,
             export_dir=export_dir,
+            use_perception=use_perception,
+            perception_script=perception_script,
+            supply_json=supply_json,
         )
     finally:
         if node is not None:

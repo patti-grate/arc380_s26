@@ -9,7 +9,15 @@ import numpy as np
 #from geometry_msgs.msg import Quaternion
 from aruco_info import aruco_corners
 #import math
+from camera import RealSenseCaptureServer
+from camera import SHARED_DIR
+import os
+import json
 
+export_dir = SHARED_DIR
+
+
+    
 def quaternion_from_euler(ai, aj, ak):
     ai /= 2.0
     aj /= 2.0
@@ -57,128 +65,163 @@ inches2metres = 0.0254
 #calib to the four corners 
 
 #get the image from a server call instead 
-video = cv2.VideoCapture(1)
-frame = video.read()
+#video = cv2.VideoCapture(1)
+node = RealSenseCaptureServer()
+node.start()
+cap = RealSenseCaptureServer.capture_frame(node)
+node.write_response(1, cap[0], cap[1])
+pathname = os.path.join(SHARED_DIR, "color.png")
+frame = cv2.imread(pathname)
 
 
 
-if frame:
-    #frame to RGB
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    corners, ids, rejected = detector6x6.detectMarkers(frame)
 
-    #process the frame's corners
-    corners = np.array([corners[i] for i in np.argsort(ids)])
-    corners = np.squeeze(corners)
-    ids = np.sort(ids)
-    src_pts = np.array([corners[0][0], corners[1][1], corners[2][2], corners[3][3]], dtype='float32')
-    dst_pts = np.array([[0, 0], [0, height*ppi], [width*ppi, height*ppi], [width*ppi, 0]], dtype='float32')
+#frame to RGB
+img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+corners, ids, rejected = detector6x6.detectMarkers(frame)
+ids = ids.flatten()
+markers_img = img_rgb.copy()
+aruco.drawDetectedMarkers(markers_img, corners, ids)
+
+print(corners)
 
 
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    
-    # Apply the perspective transformation to the input image
-    # print(img_rgb.shape[1])
-    corrected_img = cv2.warpPerspective(frame, M, (img_rgb.shape[1], img_rgb.shape[0]))
+#process the frame's corners
+corners = np.array([corners[i] for i in np.argsort(ids)])
+corners = np.squeeze(corners)
+ids = np.sort(ids)
+src_pts = np.array([corners[0][0], corners[1][1], corners[2][2], corners[3][3]], dtype='float32')
+dst_pts = np.array([[0, 0], [0, height*ppi], [width*ppi, height*ppi], [width*ppi, 0]], dtype='float32')
 
 
-    
-    _ids = ids.flatten()
+M = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
-    corners = np.array([corners[i] for i in np.argsort(ids)])
-    corners = np.squeeze(corners)
-    ids = np.sort(ids)
-    src_pts = np.array([corners[0][0], corners[1][1], corners[2][2], corners[3][3]], dtype='float32')
-    dst_pts = np.array([[0, 0], [0, height*ppi], [width*ppi, height*ppi], [width*ppi, 0]], dtype='float32')
-
-    #cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if rgb is wanted
-    markers_img = frame.copy()
-    #aruco.drawDetectedMarkers(markers_img, corners, ids)
-    # Crop the output image to the specified dimensions
-    corrected_img = corrected_img[:int(height*ppi), :int(width*ppi)]
-
-    corr_img_rgb = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2RGB)
-
-    #k-means
-    img_data = corrected_img.reshape((-1, 3))
-    img_data = np.float32(img_data)
-
-    k = 6 # maybe fix 
-
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-
-    _, labels, centers = cv2.kmeans(img_data, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-    centers = np.uint8(centers)
-    
-    # Rebuild the image using the labels and centers
-    kmeans_data = centers[labels.flatten()]
-    kmeans_img = kmeans_data.reshape(corrected_img.shape)
-    labels = labels.reshape(corrected_img.shape[:2])
-
-    block = np.array([188,156,105])
-    distances = np.linalg.norm(centers - block, axis=1)
-    block_cluster_label = np.argmin(distances)
-
-    mask_img = np.zeros(kmeans_img.shape[:block_cluster_label], dtype='uint8')
-
-    contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    areas = [cv2.contourArea(contour) for contour in contours]
-    expected_area = 1*2 * ppi**2
-
-    perimeters = [cv2.arcLength(contour, closed=True) for contour in contours]
-
-    closest_area_idx = np.argmin(np.abs(np.array(areas) - expected_area))
-
-    selected_contour_img = corrected_img.copy()
-
-    selected_contour = contours[closest_area_idx]
-
-    # Get the center using a bounding box
-    # x, y, w, h = cv2.boundingRect(selected_contour)
-    # u_c = x + w//2
-    # v_c = y + h//2
-    cv2.drawContours(selected_contour_img, contours, closest_area_idx, block, 3)
-
-    
-
-    rect = cv2.minAreaRect(selected_contour) # minAreaRect returns a Box2D structure. A Box2D structure is a tuple of ((x, y), (w, h), angle).
-    center = rect[0]
-    center = (int(center[0]), int(center[1])) # Convert to integer
-    angle = rect[2]
-    angle_rad = np.deg2rad(angle) 
-    #length = 50
-
-    # end_x = (int(center[0] + length * np.cos(angle_rad)), int(center[1] + length * np.sin(angle_rad)))
-    # end_y = (int(center[0] + length * np.cos(angle_rad + np.pi/2)), int(center[1] + length * np.sin(angle_rad + np.pi/2)))
-    #7.25in + y
-    #2in + x
-    x_0 = aruco_corners[3][4] # our frame's x = 0, y = 700 
-    y_0 = aruco_corners[0][0]
-    x_center = x_0 + rect[0][0] * inches2metres
-    y_center = rect[0][0] + rect[0][1] * inches2metres
-
-    # x_center = (corners[0][0] - corners[0][1]) / 2 + corners[0][0]
-    # y_center = (corners[0][0] - corners[1][0]) / 2 + corners[0][0]
-    z = 0.15 # dummy center of block value
-    
-    block_orientation_tuple = Quaternion()
-    #block_orientation_tuple.setRPY(0, 0, angle_rad) # assuming only rotations about the z-axis
-   
-   #assume no rotation around z 
-    block_orientation_tuple = quaternion_from_euler(np.cos(angle_rad), np.sin(angle_rad), 0)
-
-    block_orientation_tuple = block_orientation_tuple / np.linalg.norm(block_orientation_tuple)
-    block_position = [x_center, y_center, .015]
-    print(block_orientation_tuple)
-    print(block_position)
-
-    plt.imshow(cv2.cvtColor(selected_contour_img, cv2.COLOR_BGR2RGB))
-    plt.title(f'Pose of the blue square')
-    plt.gca().invert_yaxis()
-    plt.show()
-
-    print(_ids)
-    print(np.argsort(_ids))
+# Apply the perspective transformation to the input image
+# print(img_rgb.shape[1])
+corrected_img = cv2.warpPerspective(markers_img, M, (img_rgb.shape[1], img_rgb.shape[0]))
 
 
+_ids = ids.flatten()
+
+corners = np.array([corners[i] for i in np.argsort(ids)])
+corners = np.squeeze(corners)
+ids = np.sort(ids)
+src_pts = np.array([corners[0][0], corners[1][1], corners[2][2], corners[3][3]], dtype='float32')
+dst_pts = np.array([[0, 0], [0, height*ppi], [width*ppi, height*ppi], [width*ppi, 0]], dtype='float32')
+
+#cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if rgb is wanted
+markers_img = frame.copy()
+#aruco.drawDetectedMarkers(markers_img, corners, ids)
+# Crop the output image to the specified dimensions
+corrected_img = corrected_img[:int(height*ppi), :int(width*ppi)]
+
+corr_img_rgb = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2RGB)
+
+#k-means
+img_data = corrected_img.reshape((-1, 3))
+img_data = np.float32(img_data)
+
+k = 5 # maybe fix 
+
+criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+
+_, labels, centers = cv2.kmeans(img_data, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+centers = np.uint8(centers)
+
+# Rebuild the image using the labels and centers
+kmeans_data = centers[labels.flatten()]
+kmeans_img = kmeans_data.reshape(corrected_img.shape)
+labels = labels.reshape(corrected_img.shape[:2])
+# print(centers)
+
+color_centers = []
+# color_centers = img_data[centers[0], centers[1]]
+# print(centers)
+
+block = np.array([54,59,29])
+distances = np.linalg.norm(centers - block, axis=1)
+block_cluster_label = np.argmin(distances)
+
+mask_img = np.zeros(kmeans_img.shape[:block_cluster_label], dtype='uint8')
+mask_img[labels == block_cluster_label] = 255
+
+
+contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+areas = [cv2.contourArea(contour) for contour in contours]
+expected_area = 1*2 * ppi**2
+
+perimeters = [cv2.arcLength(contour, closed=True) for contour in contours]
+
+closest_area_idx = np.argmin(np.abs(np.array(areas) - expected_area))
+
+selected_contour_img = corrected_img.copy()
+
+selected_contour = contours[closest_area_idx]
+
+
+# Get the center using a bounding box
+# x, y, w, h = cv2.boundingRect(selected_contour)
+# u_c = x + w//2
+# v_c = y + h//2
+cv2.drawContours(selected_contour_img, contours, -1, (0,255,0), 3)
+
+
+plt.figure()
+plt.imshow(selected_contour_img)
+plt.show()
+
+rect = cv2.minAreaRect(selected_contour) # minAreaRect returns a Box2D structure. A Box2D structure is a tuple of ((x, y), (w, h), angle).
+center = rect[0]
+center = (int(center[0]), int(center[1])) # Convert to integer
+angle = rect[2]
+angle_rad = np.deg2rad(angle) 
+#length = 50
+
+# end_x = (int(center[0] + length * np.cos(angle_rad)), int(center[1] + length * np.sin(angle_rad)))
+# end_y = (int(center[0] + length * np.cos(angle_rad + np.pi/2)), int(center[1] + length * np.sin(angle_rad + np.pi/2)))
+#7.25in + y
+#2in + x
+
+x_0 = aruco_corners[2][3][0] # our frame's x = 0, y = 700 
+y_0 = aruco_corners[0][0][1]
+x_center = x_0 + ((rect[0][0]  / ppi) * inches2metres)
+y_center = y_0 + (((rect[0][0] + rect[0][1]) / ppi) * inches2metres) 
+
+# x_center = (corners[0][0] - corners[0][1]) / 2 + corners[0][0]
+# y_center = (corners[0][0] - corners[1][0]) / 2 + corners[0][0]
+z = 0.15 # dummy center of block value
+
+block_orientation_tuple = []
+#block_orientation_tuple.setRPY(0, 0, angle_rad) # assuming only rotations about the z-axis
+
+#assume no rotation around z 
+block_orientation_tuple = quaternion_from_euler(np.cos(angle_rad), np.sin(angle_rad), 0)
+
+block_orientation_tuple = block_orientation_tuple / np.linalg.norm(block_orientation_tuple)
+block_position = [x_center, y_center, .015]
+print(block_orientation_tuple)
+print(block_position)
+
+plt.imshow(cv2.cvtColor(selected_contour_img, cv2.COLOR_BGR2RGB))
+plt.title(f'Pose of the blue square')
+plt.gca().invert_yaxis()
+plt.show()
+
+print(_ids)
+print(np.argsort(_ids))
+
+
+if export_dir:
+    # os.makedirs(export_dir, exist_ok=True)
+    # Use demo name derived from the data path or a generic timestamp
+    export_path = os.path.join(export_dir, "supply.json")
+    payload = {
+        "supply_xyz": list(block_position),
+        "supply_quat_xyzw": list(block_orientation_tuple),
+    }
+    with open(export_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[construct] Trajectories exported to {export_path}")
+elif export_dir is not None:
+    print("[construct] Export skipped: construction was not fully successful.")
 

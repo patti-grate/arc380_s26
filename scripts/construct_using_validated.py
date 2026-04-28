@@ -1127,6 +1127,10 @@ def run_construction(
         if not homed:
             print("[construct][WARN] Could not home robot; first trajectory might reject.")
 
+    #if real mode, get supply block from camera
+    if mode == MODE_REAL:
+        
+
     # Override supply z for real mode: physical bricks sit higher than sim model.
     effective_supply_xyz = supply_xyz
     if mode == MODE_REAL and supply_xyz[2] != REAL_SUPPLY_Z:

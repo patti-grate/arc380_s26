@@ -182,28 +182,38 @@ angle_rad = np.deg2rad(angle)
 #7.25in + y
 #2in + x
 
-# Image pixel (0,0) corresponds to marker 0 corner 0 (top-left of the working area)
-# Image pixel (width*ppi, 0) corresponds to marker 3 corner 0 (top-right)
-# Image pixel (0, height*ppi) corresponds to marker 1 corner 0 (bottom-left)
-# Pixel axes: +col → robot +x direction, +row → robot +y direction
-# Origin in robot frame is marker 0, corner 0
-x_origin = aruco_corners[0][0][0]  # robot x at image pixel col=0
-y_origin = aruco_corners[0][0][1]  # robot y at image pixel row=0
+# Coordinate mapping (verified against physical setup):
+#   Image +col (rightward)  → World +Y direction
+#   Image +row (downward)   → World −X direction
+#
+# Origin in robot frame is marker 0, corner 0.
+# Scale factors derived from the span between opposite markers.
+x_origin = aruco_corners[0][0][0]  # robot X at image row=0  (marker 0 TL)
+y_origin = aruco_corners[0][0][1]  # robot Y at image col=0  (marker 0 TL)
 
-# Scale factors: total robot-frame span divided by total pixel span
-x_span_m = aruco_corners[3][0][0] - aruco_corners[0][0][0]  # marker3_TL.x - marker0_TL.x
-y_span_m = aruco_corners[1][0][1] - aruco_corners[0][0][1]  # marker1_TL.y - marker0_TL.y
-x_m_per_px = x_span_m / (width * ppi)
-y_m_per_px = y_span_m / (height * ppi)
+# World-X span is driven by image rows (marker1 is bottom-left → larger row)
+# World-Y span is driven by image cols (marker3 is top-right → larger col)
+x_span_m = aruco_corners[1][0][0] - aruco_corners[0][0][0]  # marker1_TL.x - marker0_TL.x
+y_span_m = aruco_corners[3][0][1] - aruco_corners[0][0][1]  # marker3_TL.y - marker0_TL.y
+
+# px_col increases → world +Y; px_row increases → world -X (hence the negation)
+x_m_per_px = -x_span_m / (height * ppi)   # row↑ = X↓, so negate
+y_m_per_px =  y_span_m / (width  * ppi)   # col→ = Y+
 
 # rect[0] = (pixel_col, pixel_row) of the brick centre
 px_col, px_row = rect[0]
-x_center = x_origin + px_col * x_m_per_px
-y_center = y_origin + px_row * y_m_per_px
-z = 0.030  # flat brick on table-top (matches REAL_SUPPLY_Z / DEFAULT_SUPPLY_XYZ in construct_using_validated.py)
+x_center = x_origin + px_row * x_m_per_px   # row drives world X
+y_center = y_origin + px_col * y_m_per_px   # col drives world Y
+z = 0.030  # flat brick on table-top (matches REAL_SUPPLY_Z in construct_using_validated.py)
 
-# Brick orientation: rotation about Z-axis only
-block_orientation_tuple = quaternion_from_euler(0, 0, angle_rad)
+# Brick orientation: minAreaRect angle is in image space (X=col, Y=row).
+# Rotating by +pi/2 converts from image-frame angle to world-frame yaw
+# (because image +col = world +Y, i.e. image frame is 90° CCW from world frame).
+angle_rad_world = angle_rad + np.pi / 2
+
+
+# Brick orientation: rotation about Z-axis only (angle already converted to world frame)
+block_orientation_tuple = quaternion_from_euler(0, 0, angle_rad_world)
 block_orientation_tuple = block_orientation_tuple / np.linalg.norm(block_orientation_tuple)
 block_position = [x_center, y_center, z]
 print(block_orientation_tuple)

@@ -145,14 +145,34 @@ block_cluster_label = np.argmin(distances)
 mask_img = np.zeros(kmeans_img.shape[:2], dtype='uint8')
 mask_img[labels == block_cluster_label] = 255
 
+# ── Exclude ArUco marker regions from the mask ───────────────────────────────
+# After perspective correction the four ArUco markers sit at the image corners.
+# Their dark squares are often assigned to the same k-means cluster as the brick,
+# causing the contour-picker to land on a marker instead of the actual brick.
+# Zero out a 1.5-inch margin at every corner to eliminate them.
+_aruco_margin = int(1.5 * ppi)   # ~144 px  (markers are ~1 in = 96 px)
+_H, _W = mask_img.shape
+mask_img[:_aruco_margin,  :_aruco_margin]  = 0   # top-left
+mask_img[:_aruco_margin,  _W-_aruco_margin:] = 0  # top-right
+mask_img[_H-_aruco_margin:, :_aruco_margin]  = 0  # bottom-left
+mask_img[_H-_aruco_margin:, _W-_aruco_margin:] = 0  # bottom-right
 
 contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-areas = [cv2.contourArea(contour) for contour in contours]
-expected_area = 1*2 * ppi**2
 
-perimeters = [cv2.arcLength(contour, closed=True) for contour in contours]
+# Keep only contours whose area is plausibly brick-sized (0.25× – 4× expected)
+expected_area = 1 * 2 * ppi**2   # 1 in × 2 in footprint in pixels
+areas = [cv2.contourArea(c) for c in contours]
+valid = [
+    (i, a) for i, a in enumerate(areas)
+    if expected_area * 0.25 < a < expected_area * 4.0
+]
+if not valid:
+    # Fallback: no area filter (keeps original behaviour)
+    print("[perception] WARNING: no contour passed the area filter; using closest-area fallback.")
+    valid = list(enumerate(areas))
 
-closest_area_idx = np.argmin(np.abs(np.array(areas) - expected_area))
+closest_area_idx = min(valid, key=lambda ia: abs(ia[1] - expected_area))[0]
+
 
 selected_contour_img = corrected_img.copy()
 

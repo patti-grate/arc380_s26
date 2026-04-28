@@ -13,6 +13,7 @@ from camera import RealSenseCaptureServer
 from camera import SHARED_DIR
 import os
 import json
+import time
 
 export_dir = SHARED_DIR
 
@@ -68,6 +69,7 @@ inches2metres = 0.0254
 #video = cv2.VideoCapture(1)
 node = RealSenseCaptureServer()
 node.start()
+time.sleep(3)
 cap = RealSenseCaptureServer.capture_frame(node)
 node.write_response(1, cap[0], cap[1])
 pathname = os.path.join(SHARED_DIR, "color.png")
@@ -138,7 +140,7 @@ color_centers = []
 # color_centers = img_data[centers[0], centers[1]]
 # print(centers)
 
-block = np.array([54,59,29])
+block = np.array([0,0,255])
 distances = np.linalg.norm(centers - block, axis=1)
 block_cluster_label = np.argmin(distances)
 
@@ -148,7 +150,7 @@ mask_img[labels == block_cluster_label] = 255
 
 contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 areas = [cv2.contourArea(contour) for contour in contours]
-expected_area = 1*2 * ppi**2
+expected_area = 2.0*.80 * ppi**2
 
 perimeters = [cv2.arcLength(contour, closed=True) for contour in contours]
 
@@ -187,17 +189,20 @@ angle_rad = np.deg2rad(angle)
 # Image pixel (0, height*ppi) corresponds to marker 1 corner 0 (bottom-left)
 # Pixel axes: +col → robot +x direction, +row → robot +y direction
 # Origin in robot frame is marker 0, corner 0
-x_origin = aruco_corners[0][0][0]  # robot x at image pixel col=0
-y_origin = aruco_corners[0][0][1]  # robot y at image pixel row=0
+x_origin = aruco_corners[1][3][0]  # robot x at image pixel col=0
+y_origin = aruco_corners[1][3][1]  # robot y at image pixel row=0
 
 # Scale factors: total robot-frame span divided by total pixel span
-x_span_m = aruco_corners[3][0][0] - aruco_corners[0][0][0]  # marker3_TL.x - marker0_TL.x
-y_span_m = aruco_corners[1][0][1] - aruco_corners[0][0][1]  # marker1_TL.y - marker0_TL.y
+x_span_m = aruco_corners[0][2][0] - aruco_corners[1][3][0]  # marker3_TL.x - marker0_TL.x
+y_span_m = aruco_corners[3][1][1] - aruco_corners[0][2][1]  # marker1_TL.y - marker0_TL.y
+
 x_m_per_px = x_span_m / (width * ppi)
 y_m_per_px = y_span_m / (height * ppi)
 
 # rect[0] = (pixel_col, pixel_row) of the brick centre
 px_col, px_row = rect[0]
+print(px_col, px_row)
+print(x_m_per_px, y_m_per_px)
 x_center = x_origin + px_col * x_m_per_px
 y_center = y_origin + px_row * y_m_per_px
 z = 0.030  # flat brick on table-top (matches REAL_SUPPLY_Z / DEFAULT_SUPPLY_XYZ in construct_using_validated.py)

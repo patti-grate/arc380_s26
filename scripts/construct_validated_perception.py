@@ -221,7 +221,7 @@ SAFE_HOME_NAMES: list[str] = [
     "joint_5",
     "joint_6",
 ]
-SAFE_HOME_POSITIONS: list[float] = [1.57, 0.00, 0.00, 0.00, 1.57, 1.57]
+SAFE_HOME_POSITIONS: list[float] = [0.57, 0.00, 0.00, 0.00, 1.57, 1.57]
 
 # Gazebo SDF path for bricks (used in --sim mode for visual spawning)
 _SDF_PATH = os.path.normpath(

@@ -1094,12 +1094,11 @@ def execute_brick_sequence(
 def detect_supply_pose(
     perception_script: str,
     supply_json: str,
-    fallback_xyz: tuple[float, float, float],
-    fallback_quat: tuple[float, float, float, float],
-) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+) -> Optional[tuple[tuple[float, float, float], tuple[float, float, float, float]]]:
     """
-    Run perception_simple.py as a subprocess, wait for it to write supply.json,
-    then return (xyz, quat_xyzw).  Falls back to the provided defaults on any error.
+    Run perception_simple.py as a subprocess, read supply.json, and return
+    (xyz, quat_xyzw).  Returns None on any failure — callers must handle this
+    explicitly rather than silently falling back to a hardcoded pose.
     """
     import subprocess as _sp
 
@@ -1112,12 +1111,13 @@ def detect_supply_pose(
             timeout=60,
         )
         if result.returncode != 0:
-            print(f"[perception] WARNING: script exited {result.returncode}")
-            print(result.stderr[-800:] if result.stderr else "(no stderr)")
-            return fallback_xyz, fallback_quat
+            print(f"[perception] FAILED: script exited {result.returncode}")
+            if result.stderr:
+                print(result.stderr[-800:])
+            return None
     except Exception as exc:
-        print(f"[perception] ERROR running perception script: {exc}")
-        return fallback_xyz, fallback_quat
+        print(f"[perception] FAILED: could not run perception script: {exc}")
+        return None
 
     try:
         with open(supply_json) as _f:
@@ -1131,8 +1131,8 @@ def detect_supply_pose(
         )
         return xyz, quat  # type: ignore
     except Exception as exc:
-        print(f"[perception] ERROR reading supply.json: {exc}")
-        return fallback_xyz, fallback_quat
+        print(f"[perception] FAILED: could not read supply.json: {exc}")
+        return None
 
 
 # ===========================================================================
@@ -1274,19 +1274,54 @@ def run_construction(
         )
 
         # ----------------------------------------------------------------
-        # Step 3: Detect supply pose via camera (or use fallback)
+        # Step 3: Detect supply pose via camera (or prompt for manual entry)
         # ----------------------------------------------------------------
+        detected_xyz: Optional[tuple[float, float, float]] = None
+        detected_quat: Optional[tuple[float, float, float, float]] = None
+
         if use_perception and perception_script and supply_json:
-            detected_xyz, detected_quat = detect_supply_pose(
-                perception_script, supply_json,
-                fallback_xyz=supply_xyz,
-                fallback_quat=supply_quat_xyzw,
-            )
+            while detected_xyz is None:
+                result = detect_supply_pose(perception_script, supply_json)
+                if result is not None:
+                    detected_xyz, detected_quat = result
+                else:
+                    print("[perception] Detection failed — no pose available.")
+                    action = input(
+                        "  [r] retry camera  |  [m] enter XYZ manually  |  [skip] skip brick: "
+                    ).strip().lower()
+                    if action == "r":
+                        continue
+                    elif action == "m":
+                        raw = input(
+                            "  Enter supply XYZ as X,Y (Z is fixed to table height): "
+                        ).strip()
+                        try:
+                            parts = [float(v) for v in raw.split(",")]
+                            if len(parts) != 2:
+                                raise ValueError("need exactly 2 values")
+                            detected_xyz = (parts[0], parts[1], REAL_SUPPLY_Z)
+                            detected_quat = (0.0, 0.0, 0.0, 1.0)
+                            print(f"[construct] Manual supply xyz={detected_xyz}")
+                        except ValueError as exc:
+                            print(f"  Invalid input ({exc}), retrying...")
+                    elif action == "skip":
+                        print("[construct] Brick skipped by operator after perception failure.")
+                        failed_bricks.append(brick_idx)
+                        break
+                    else:
+                        print("  Unknown action — retrying camera.")
+            else:
+                # while loop exited normally (detected_xyz is set): continue below
+                pass
+
+            if detected_xyz is None:
+                # Operator chose to skip this brick
+                continue
         else:
             detected_xyz, detected_quat = supply_xyz, supply_quat_xyzw
             print(f"[construct] Perception skipped. Using supply_xyz={detected_xyz}")
 
-        # Always use the hardcoded supply Z (brick flat on table)
+        # Always use the table-height Z for supply (brick sits flat on the surface)
         detected_xyz = (detected_xyz[0], detected_xyz[1], REAL_SUPPLY_Z)
         current_supply_7d = np.array([*detected_xyz, *detected_quat])
 

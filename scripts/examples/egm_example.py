@@ -6,6 +6,7 @@ import rclpy
 from example_interfaces.srv import SetBool
 from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.msg import (
+    AttachedCollisionObject,
     BoundingVolume,
     CollisionObject,
     Constraints,
@@ -17,7 +18,7 @@ from moveit_msgs.msg import (
     RobotState,
     RobotTrajectory,
 )
-from moveit_msgs.srv import GetMotionPlan, GetPlanningScene
+from moveit_msgs.srv import GetCartesianPath, GetMotionPlan, GetPlanningScene, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -61,11 +62,18 @@ class EGMClient(Node):
         self._collision_object_pub = self.create_publisher(
             CollisionObject, "/collision_object", _COLLISION_OBJECT_QOS
         )
+        self._attached_object_pub = self.create_publisher(
+            AttachedCollisionObject, "/attached_collision_object", _COLLISION_OBJECT_QOS
+        )
 
         # Planning scene query service (used by remove_all_world_collision_objects)
         self._get_planning_scene_cli = self.create_client(
             GetPlanningScene, "/get_planning_scene"
         )
+        # IK feasibility check service
+        self._ik_cli = self.create_client(GetPositionIK, "/compute_ik")
+        # Cartesian path service
+        self._cartesian_cli = self.create_client(GetCartesianPath, "/compute_cartesian_path")
 
     @staticmethod
     def _make_start_state(joint_names, joint_positions) -> RobotState:
@@ -405,6 +413,153 @@ class EGMClient(Node):
             f"Cleared {len(id_to_frame)} world collision object(s)."
         )
         return len(id_to_frame)
+
+    def attach_box_to_gripper(
+        self,
+        object_id: str,
+        size_xyz: tuple,
+        link_name: str = "gripper_tcp_calibrated",
+        touch_links: list | None = None,
+    ) -> None:
+        """Attach a collision box to the gripper TCP so MoveIt avoids it during planning."""
+        aco = AttachedCollisionObject()
+        aco.link_name = link_name
+        aco.object.header.frame_id = link_name
+        aco.object.id = object_id
+        aco.object.operation = CollisionObject.ADD
+
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [float(size_xyz[0]), float(size_xyz[1]), float(size_xyz[2])]
+
+        prim_pose = Pose()
+        prim_pose.orientation.w = 1.0
+        aco.object.primitives = [box]
+        aco.object.primitive_poses = [prim_pose]
+
+        if touch_links is None:
+            aco.touch_links = [
+                "gripper_tcp", "gripper_tcp_calibrated", "link_6", "link_5",
+                "gripper_base", "left_finger", "right_finger",
+            ]
+        else:
+            aco.touch_links = touch_links
+
+        for _ in range(5):
+            self._attached_object_pub.publish(aco)
+            time.sleep(0.02)
+
+    def detach_box_from_gripper(self, object_id: str) -> None:
+        """Detach and remove an attached collision object from the gripper."""
+        aco = AttachedCollisionObject()
+        aco.object.id = object_id
+        aco.object.operation = CollisionObject.REMOVE
+        for _ in range(5):
+            self._attached_object_pub.publish(aco)
+            time.sleep(0.02)
+
+    def check_ik(
+        self,
+        group_name: str,
+        link_name: str,
+        frame_id: str,
+        target_xyz: tuple,
+        target_quat_xyzw: tuple,
+        start_joint_names: list | None = None,
+        start_joint_positions: list | None = None,
+        timeout_sec: float = 0.5,
+        avoid_collisions: bool = False,
+    ) -> bool:
+        """
+        Fast IK feasibility check via /compute_ik.
+        Returns True if a valid IK solution exists; falls back to True if the
+        service is unavailable so OMPL remains the gate.
+        """
+        from moveit_msgs.msg import PositionIKRequest
+
+        if not self._ik_cli.wait_for_service(timeout_sec=0.5):
+            return True  # service not up -- let OMPL decide
+
+        ikr = PositionIKRequest()
+        ikr.group_name = group_name
+        ikr.ik_link_name = link_name
+        ikr.avoid_collisions = avoid_collisions
+
+        ps = PoseStamped()
+        ps.header.frame_id = frame_id
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = float(target_xyz[0])
+        ps.pose.position.y = float(target_xyz[1])
+        ps.pose.position.z = float(target_xyz[2])
+        qx, qy, qz, qw = target_quat_xyzw
+        ps.pose.orientation.x = float(qx)
+        ps.pose.orientation.y = float(qy)
+        ps.pose.orientation.z = float(qz)
+        ps.pose.orientation.w = float(qw)
+        ikr.pose_stamped = ps
+
+        if start_joint_names and start_joint_positions:
+            ikr.robot_state = self._make_start_state(start_joint_names, start_joint_positions)
+        else:
+            zero_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+            ikr.robot_state = self._make_start_state(zero_names, [0.0] * 6)
+
+        ikr.timeout.nanosec = int(timeout_sec * 1e9)
+        req = GetPositionIK.Request()
+        req.ik_request = ikr
+
+        fut = self._ik_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=timeout_sec + 0.5)
+
+        if fut.result() is None:
+            return True  # timeout -- optimistically pass through
+        return fut.result().error_code.val == 1  # SUCCESS == 1
+
+    def plan_cartesian_path(
+        self,
+        group_name: str,
+        link_name: str,
+        frame_id: str,
+        waypoints: list,
+        start_joint_names: list | None = None,
+        start_joint_positions: list | None = None,
+        max_step: float = 0.01,
+        jump_threshold: float = 0.0,
+        avoid_collisions: bool = True,
+    ):
+        """Plan a linear Cartesian path through a list of Pose waypoints."""
+        if not self._cartesian_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error("/compute_cartesian_path service not available.")
+            return None
+
+        from moveit_msgs.srv import GetCartesianPath as _GCP
+        req = _GCP.Request()
+        req.header.frame_id = frame_id
+        req.header.stamp = self.get_clock().now().to_msg()
+        if start_joint_names and start_joint_positions:
+            req.start_state = self._make_start_state(start_joint_names, start_joint_positions)
+        req.group_name = group_name
+        req.link_name = link_name
+        req.waypoints = waypoints
+        req.max_step = max_step
+        req.jump_threshold = jump_threshold
+        req.avoid_collisions = avoid_collisions
+
+        fut = self._cartesian_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
+        if fut.result() is None:
+            self.get_logger().error("Cartesian planning service call failed.")
+            return None
+        res = fut.result()
+        if res.fraction < 1.0:
+            self.get_logger().warn(f"Cartesian path only {res.fraction * 100:.1f}% complete.")
+            return None
+        return res.solution
+
+    def reset_gazebo_simulation(self, **kwargs) -> bool:
+        """No-op on real robot (Gazebo is sim-only). Always returns False."""
+        self.get_logger().warn("reset_gazebo_simulation() called in real mode — ignored.")
+        return False
 
     def replay_arm_trajectory(self, robot_traj: RobotTrajectory) -> bool:
         """Replay a pre-planned RobotTrajectory via EGM (same path as live execution)."""

@@ -91,7 +91,7 @@ python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0 --stru
 ```
 
 #### Adjustable Parameters
-- `--batch`: Switch between data batches (e.g., `batch0`, `batch1`).
+- `--batch`: Batch folder inside `training_data/` (e.g., `batch1`, `batch2`, `batch3`). **Required if using a non-default batch** — defaults to `batch1`.
 - `--structure-z-offset`: Vertical offset (meters) to apply to the entire target structure (e.g. `--structure-z-offset 0.01`).
 - `--hover-z`: Additional Z height for pre/post grasp hover in metres (default: `0.12`).
 - `--supply-xyz`: Override the fixed supply brick position as `X,Y,Z` (default: `-0.20,0.40,0.030`).
@@ -304,7 +304,7 @@ Uses the standard SST checkpoint (`best_model.pth`).
 ```bash
 # Inside the docker container
 python3 scripts/model_evaluation.py \
-    --checkpoint training_data/trained_models/best_model.pth \
+    --checkpoint training_data/trained_models/latest_model_cog_aware.pth \
     --max-bricks 30 --n-candidates 100 \
     --output-dir training_data/model_generated
 ```
@@ -321,14 +321,15 @@ python3 scripts/model_evaluation.py \
 
 ### COG-Aware Evaluator (`scripts/model_evaluation_rich_feature.py`)
 
-Uses the COG-aware staged checkpoint (`best_model_cog_aware.pth`) with 17-dim features and critical-point projection output. Requires a seed layer (layer-0 bricks from a validated sequence) to provide initial support context.
+Uses the COG-aware staged checkpoint (`best_model_cog_aware.pth`) with 17-dim features and critical-point projection output. Requires a seed sequence to provide initial support context; the number of seeded layers is configurable.
 
 ```bash
 # Inside the docker container
 python3 scripts/model_evaluation_rich_feature.py \
-    --checkpoint training_data/trained_models/best_model_cog_aware.pth \
+    --checkpoint training_data/trained_models/latest_model_cog_aware.pth \
     --max-bricks 30 --n-candidates 100 \
     --seed-sequence training_data/batch2/validated_simPhysics/demo_1/5d_sequence/sequence.json \
+    --seed-layers 1 \
     --output-dir training_data/model_generated_cog
 ```
 
@@ -340,11 +341,12 @@ python3 scripts/model_evaluation_rich_feature.py \
 | `--max-rounds` | `5` | Re-sample attempts before giving up on a brick |
 | `--no-reachability-check` | off | Skip MoveIt IK check (faster, sim-only) |
 | `--output-dir` | `training_data/model_generated_cog` | Directory for output JSON sequences |
-| `--seed-sequence` | `batch2/.../demo_1/5d_sequence/sequence.json` | 5D sequence to use as the fixed seed layer |
+| `--seed-sequence` | `batch2/.../demo_1/5d_sequence/sequence.json` | 5D sequence to draw seed bricks from |
+| `--seed-layers` | `1` | Number of layers from `--seed-sequence` to place as fixed seed before sampling begins |
 
 ### Evaluation Loop (both scripts)
 
-1. Seed bricks from `--seed-sequence` (layer 0) are placed without sampling
+1. The first `--seed-layers` layers from `--seed-sequence` are placed without sampling
 2. **COG-aware evaluator** uses 3-pass staged inference per brick:
    - Pass 1: predict `b`, `layer_id`, `support_state` from scene encoding
    - Pass 2: score each history token → argmax → select `s1`, `s2` support bricks

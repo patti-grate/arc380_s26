@@ -554,17 +554,32 @@ def _remove_brick(validator, brick_name):
 # Seed layer
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_seed_layer(seed_path, z_lookup):
+def load_seed_layer(seed_path, z_lookup, n_layers=1):
+    """
+    Load the first n_layers layers from a sequence as seed bricks.
+
+    Each brick's z is snapped to the nearest z_lookup entry so that
+    simulated heights are used rather than the raw sequence z values.
+    """
     with open(seed_path) as f:
         poses = json.load(f)
-    target_z = z_lookup.get(0, None)
-    if target_z is None:
-        return []
+
+    # Assign layer IDs to the full sequence
+    layer_ids = assign_layer_ids([[float(v) for v in p] for p in poses])
     z_tol = 5e-3
-    return [
-        [float(p[0]), float(p[1]), target_z, int(p[3]), float(p[4])]
-        for p in poses if abs(float(p[2]) - target_z) < z_tol
-    ]
+
+    result = []
+    for p, lid in zip(poses, layer_ids):
+        if lid >= n_layers:
+            continue
+        target_z = z_lookup.get(lid, None)
+        if target_z is None:
+            continue
+        if abs(float(p[2]) - target_z) > z_tol:
+            # Snap regardless — z_lookup is authoritative
+            pass
+        result.append([float(p[0]), float(p[1]), target_z, int(p[3]), float(p[4])])
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -742,6 +757,10 @@ def main():
         "--seed-sequence",
         default="training_data/batch2/validated_simPhysics/demo_1/5d_sequence/sequence.json",
     )
+    parser.add_argument(
+        "--seed-layers", type=int, default=1,
+        help="Number of layers from --seed-sequence to place as fixed seed (default: 1).",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -778,8 +797,8 @@ def main():
         if not seed_path.exists():
             print(f"ERROR: seed sequence not found: {seed_path}")
             sys.exit(1)
-        seed_layer = load_seed_layer(str(seed_path), z_lookup)
-        print(f"Seed layer: {len(seed_layer)} bricks from {seed_path}"
+        seed_layer = load_seed_layer(str(seed_path), z_lookup, n_layers=args.seed_layers)
+        print(f"Seed ({args.seed_layers} layer(s)): {len(seed_layer)} bricks from {seed_path}"
               if seed_layer else "WARNING: no seed bricks found")
 
     if HAVE_ROS2:

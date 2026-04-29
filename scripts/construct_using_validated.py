@@ -20,13 +20,17 @@ Workflow
 Usage (inside Docker with MoveIt running)
 ------------------------------------------
   # Dry-run (planning only, no execution -- safe to run anywhere):
-  python3 scripts/construct_using_validated.py --demo demo_0
+  python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0
+
+  # Dry-run with batch2 demo_1:
+  python3 scripts/construct_using_validated.py --batch batch2 --demo demo_1
 
   # Real robot execution (run ONLY inside ros2_real Docker container):
-  python3 scripts/construct_using_validated.py --demo demo_0 --real
+  python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0 --real
 
 CLI arguments
 -------------
+  --batch    : batch folder inside training_data/ (default: batch1)
   --demo     : demo name inside validated_simPhysics/ (default: demo_0)
   --data-dir : override path to validated_simPhysics root
   --real     : enable real robot execution (default: dry-run)

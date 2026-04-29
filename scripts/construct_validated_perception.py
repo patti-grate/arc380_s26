@@ -1096,34 +1096,28 @@ def detect_supply_pose(
     supply_json: str,
 ) -> Optional[tuple[tuple[float, float, float], tuple[float, float, float, float]]]:
     """
-    Run perception_simple.py as a subprocess, read supply.json, and return
+    Import and call run_perception() directly from perception_simple.py, return
     (xyz, quat_xyzw).  Returns None on any failure — callers must handle this
     explicitly rather than silently falling back to a hardcoded pose.
     """
-    import subprocess as _sp
-
     print("[perception] Running camera detection...")
     try:
-        result = _sp.run(
-            [sys.executable, perception_script],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            print(f"[perception] FAILED: script exited {result.returncode}")
-            if result.stderr:
-                print(result.stderr[-800:])
-            return None
+        _scripts_dir = os.path.dirname(os.path.abspath(perception_script))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from perception_simple import run_perception  # type: ignore
+        result = run_perception()
     except Exception as exc:
-        print(f"[perception] FAILED: could not run perception script: {exc}")
+        print(f"[perception] FAILED: could not run perception: {exc}")
+        return None
+
+    if result is None:
+        print("[perception] FAILED: run_perception() returned None")
         return None
 
     try:
-        with open(supply_json) as _f:
-            data = json.load(_f)
-        xyz = tuple(float(v) for v in data["supply_xyz"])       # type: ignore
-        quat = tuple(float(v) for v in data["supply_quat_xyzw"])  # type: ignore
+        xyz = tuple(float(v) for v in result["supply_xyz"])        # type: ignore
+        quat = tuple(float(v) for v in result["supply_quat_xyzw"]) # type: ignore
         print(
             f"[perception] Detected supply pose: "
             f"xyz=({xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f})  "
@@ -1131,7 +1125,7 @@ def detect_supply_pose(
         )
         return xyz, quat  # type: ignore
     except Exception as exc:
-        print(f"[perception] FAILED: could not read supply.json: {exc}")
+        print(f"[perception] FAILED: could not parse perception result: {exc}")
         return None
 
 

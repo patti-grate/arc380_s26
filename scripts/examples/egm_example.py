@@ -123,7 +123,7 @@ class EGMClient(Node):
     def _make_orientation_constraint(
         link_name: str,
         frame_id: str,
-        target_quat_wxyz,
+        target_quat_xyzw: tuple[float, float, float, float],
         tolerance_rpy=(0.05, 0.05, 0.05),
         weight: float = 1.0,
     ) -> OrientationConstraint:
@@ -132,10 +132,12 @@ class EGMClient(Node):
         oc.link_name = link_name
         oc.weight = float(weight)
 
-        oc.orientation.w = float(target_quat_wxyz[0])
-        oc.orientation.x = float(target_quat_wxyz[1])
-        oc.orientation.y = float(target_quat_wxyz[2])
-        oc.orientation.z = float(target_quat_wxyz[3])
+        qx, qy, qz, qw = target_quat_xyzw
+        oc.orientation.x = float(qx)
+        oc.orientation.y = float(qy)
+        oc.orientation.z = float(qz)
+        oc.orientation.w = float(qw)
+
 
         oc.absolute_x_axis_tolerance = float(tolerance_rpy[0])
         oc.absolute_y_axis_tolerance = float(tolerance_rpy[1])
@@ -196,7 +198,7 @@ class EGMClient(Node):
         goal_xyz: tuple[float, float, float],
         start_joint_names: list[str] | None = None,
         start_joint_positions: list[float] | None = None,
-        goal_quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        goal_quat_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
         pos_tolerance_xyz: tuple[float, float, float] = (0.001, 0.001, 0.001),
         ori_tolerance_rpy: tuple[float, float, float] = (0.001, 0.001, 0.001),
         allowed_planning_time: float = 5.0,
@@ -204,8 +206,17 @@ class EGMClient(Node):
         max_velocity_scaling: float | None = None,
         max_acceleration_scaling: float | None = None,
         planner_id: str = "",
+        joint_1_constraints: float | None = None,
+        joint_2_constraints: float | None = None,
+        joint_3_constraints: float | None = None,
+        joint_4_constraints: float | None = None,
+        joint_5_constraints: float | None = None,
+        joint_6_constraints: float | None = None,
+        lock_wrist_to_start: bool = False,
+        lock_wrist_tolerance: float = 0.4,
     ) -> Optional[RobotTrajectory]:
         mpr = MotionPlanRequest()
+
         mpr.group_name = group_name
         if planner_id:
             mpr.planner_id = planner_id
@@ -226,11 +237,40 @@ class EGMClient(Node):
             self._make_orientation_constraint(
                 link_name=link_name,
                 frame_id=frame_id,
-                target_quat_wxyz=goal_quat_wxyz,
+                target_quat_xyzw=goal_quat_xyzw,
                 tolerance_rpy=ori_tolerance_rpy,
             )
         ]
+
+        # Add joint constraints if provided
+        joint_constraints = []
+        c_map = {
+            "joint_1": joint_1_constraints,
+            "joint_2": joint_2_constraints,
+            "joint_3": joint_3_constraints,
+            "joint_4": joint_4_constraints,
+            "joint_5": joint_5_constraints,
+            "joint_6": joint_6_constraints,
+        }
+        for j_name, j_val in c_map.items():
+            if j_val is not None:
+                joint_constraints.append(
+                    self._make_joint_constraint(j_name, j_val, tolerance_above=0.1, tolerance_below=0.1)
+                )
+        
+        if lock_wrist_to_start and start_joint_names and start_joint_positions:
+            s_map = dict(zip(start_joint_names, start_joint_positions))
+            for j_name in ["joint_4", "joint_5", "joint_6"]:
+                if j_name in s_map:
+                    joint_constraints.append(
+                        self._make_joint_constraint(j_name, s_map[j_name], tolerance_above=lock_wrist_tolerance, tolerance_below=lock_wrist_tolerance)
+                    )
+
+        if joint_constraints:
+            constraints.joint_constraints = joint_constraints
+
         mpr.goal_constraints = [constraints]
+
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)

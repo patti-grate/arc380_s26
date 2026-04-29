@@ -11,7 +11,11 @@ from typing import Any
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -132,9 +136,15 @@ def safe_unlink(path: Path) -> None:
 
 class RealSenseCaptureServer:
     def __init__(self) -> None:
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.align = rs.align(rs.stream.color) if ALIGN_DEPTH_TO_COLOR else None
+        if rs is not None:
+            self.pipeline = rs.pipeline()
+            self.config = rs.config()
+            self.align = rs.align(rs.stream.color) if ALIGN_DEPTH_TO_COLOR else None
+        else:
+            self.pipeline = None
+            self.config = None
+            self.align = None
+
         self.running = True
         self.last_request_id = -1
         self.pipeline_profile: rs.pipeline_profile | None = None
@@ -143,6 +153,10 @@ class RealSenseCaptureServer:
         self.device_serial = "unknown"
 
     def start(self) -> None:
+        if rs is None:
+            raise RuntimeError("pyrealsense2 is not installed; camera capture is unavailable.")
+        SHARED_DIR.mkdir(parents=True, exist_ok=True)
+
         SHARED_DIR.mkdir(parents=True, exist_ok=True)
 
         self.config.enable_stream(

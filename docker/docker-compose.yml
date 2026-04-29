@@ -52,8 +52,7 @@ services:
   ros2_real:
     <<: *ros2-common
     container_name: arc380_ros2_real
+    privileged: true
     ports:
       - "6511:6511/udp"
-    devices:
-      - /dev/bus/usb:/dev/bus/usb
     command: ros2 launch abb_egm_controller egm_controller.launch.py

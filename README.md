@@ -130,7 +130,7 @@ Operator-guided construction where the robot stops between each brick and uses t
 
 **Hybrid mode — perceive + plan in sim + execute on real (recommended for best collision checking):**
 ```bash
-python3 scripts/construct_validated_perception.py --demo demo_0 --hybrid
+python3 scripts/construct_validated_perception.py --demo demo_0 --hybrid --structure-z-offset 0.004
 ```
 
 **Real mode — perceive + plan with MoveIt scene + execute on real:**

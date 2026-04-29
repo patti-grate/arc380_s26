@@ -38,14 +38,19 @@ _COLLISION_OBJECT_QOS = QoSProfile(
 
 class EGMClient(Node):
     def __init__(
-        self, 
-        max_velocity_scaling: float = 0.2, 
-        max_acceleration_scaling: float = 0.2
+        self,
+        max_velocity_scaling: float = 0.2,
+        max_acceleration_scaling: float = 0.2,
+        use_sim_time: bool = False,
     ):
         super().__init__("egm_client")
         self._max_velocity_scaling = max_velocity_scaling
         self._max_acceleration_scaling = max_acceleration_scaling
-        self.set_parameters([Parameter("use_sim_time", value=True)])
+        # use_sim_time=True is only correct when Gazebo is publishing /clock.
+        # Real-robot deployments must leave this False (default) so system clock
+        # is used and spin_until_future_complete timeouts behave correctly.
+        if use_sim_time:
+            self.set_parameters([Parameter("use_sim_time", value=True)])
 
         # MoveIt planning service
         self.plan_cli = self.create_client(GetMotionPlan, "/plan_kinematic_path")

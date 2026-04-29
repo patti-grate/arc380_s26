@@ -2,17 +2,20 @@
 """
 model_evaluation_rich_feature.py  —  COG-aware staged SST brick assembly in Gazebo.
 
-Architecture (mirrors training_SST_z_refactoring.ipynb — COG-aware refactor):
+Architecture (mirrors training_SST_sequential2.ipynb):
   Transformer encoder → scene (CLS) + per-token embeddings
-  → b_head (binary) + layer_head (class) + ss_head (support state 0/1/2)
-  → s1_score_head (per-token, conditioned on b, layer) → argmax → s1
-  → s2_score_head (per-token, conditioned on b, layer, s1_emb) → argmax → s2
-  → proj_head (scene, s1_emb, s2_emb, b, layer) → [alpha_A, perp_A, alpha_B, perp_B]
+  → advance_head (binary: stay / advance layer)
+  → derive pred_layer = max_hist_layer + advance
+  → derive pred_b = B_FROM_LAYER[pred_layer % 3]   (period-3 deterministic)
+  → derive pred_z = z_lookup[pred_layer]            (from training-data mean)
+  → ss_head (support state 0/1/2)
+  → heuristic s1/s2 selection from previous layer
+  → proj_head([scene | s1_emb | s2_emb | layer_norm]) → [alpha_A, perp_A, alpha_B, perp_B]
   → decode critical-point projections → world (x, y, r)
-  → snap z from z_lookup[layer_id]
 
-17-dim token per brick:
-  base pose    (7): x_n, y_n, b, sin_r, cos_r, layer_norm, time_norm
+16-dim token per brick:
+  base pose    (5): rel_x, rel_y, b, sin_r, cos_r  (coords relative to context centroid)
+  rel_age      (1): (len(context) - time_index) / (MAX_LAYER_NORM * 3)
   layer state  (3): rel_to_top, is_top, is_second_top
   same-layer   (5): count_norm, ndx, ndy, ndist, is_frontier
   geometry     (1): crit_span_norm
@@ -20,7 +23,7 @@ Architecture (mirrors training_SST_z_refactoring.ipynb — COG-aware refactor):
 
 Usage:
   python scripts/model_evaluation_rich_feature.py \\
-      --checkpoint training_data/trained_models/best_model_cog_aware.pth \\
+      --checkpoint training_data/trained_models/latest_model_cog_aware.pth \\
       --max-bricks 30 --n-candidates 100 \\
       --seed-sequence training_data/batch2/validated_simPhysics/demo_1/5d_sequence/sequence.json
 """
@@ -82,7 +85,7 @@ if HAVE_ROS2:
 # Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-FEATURE_DIM      = 17
+FEATURE_DIM      = 16
 PROJ_DIM         = 4      # [alpha_A, perp_A, alpha_B, perp_B]
 N_SUPPORT_STATES = 3
 HIDDEN_DIM       = 128
@@ -97,19 +100,36 @@ BRICK_W = 0.051
 BRICK_D = 0.023
 BRICK_H = 0.014
 
+# Period-3 b pattern: layer%3==0 → laying(0), 1 → standing(1), 2 → laying(0)
+B_FROM_LAYER = [0, 1, 0]
+
+# Maximum perpendicular distance (m) for a brick to count as a valid support
+SUPPORT_RADIUS_M = 0.03
+
 # Fixed noise for projection sampling at inference
 SIGMA_PROJ = [0.15, 0.08, 0.15, 0.08]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Model — mirrors training_SST_z_refactoring.ipynb (COG-aware)
+# Model — mirrors training_SST_sequential2.ipynb
 # ══════════════════════════════════════════════════════════════════════════════
+
+def b_from_layer(layer_id: int) -> int:
+    """Period-3 deterministic b: 0→laying, 1→standing, 2→laying, repeat."""
+    return B_FROM_LAYER[layer_id % len(B_FROM_LAYER)]
+
 
 class NextBrickModel(nn.Module):
     """
-    COG-aware staged model.
+    Simplified COG-aware model matching training_SST_sequential2.ipynb.
 
-    Heads: b, layer, ss (support state), s1_score, s2_score, proj.
+    Heads:
+      advance_head  scene → binary (stay / advance to next layer)
+      ss_head       scene → support-state (0=ground, 1=one-sup, 2=two-sup)
+      proj_head     [scene | s1_emb | s2_emb | layer_norm(1)] → PROJ_DIM=4
+
+    b and z are derived deterministically from pred_layer at inference.
+    s1/s2 are selected heuristically at inference; teacher-forced in training.
     """
 
     def __init__(
@@ -120,12 +140,12 @@ class NextBrickModel(nn.Module):
         num_layers=N_LAYERS,
         ff_dim=FF_DIM,
         dropout=DROPOUT,
-        max_layer_classes=13,
+        max_layer_classes=12,
     ):
         super().__init__()
         H = hidden_dim
-        self.hidden_dim    = H
-        self.n_layers_cls  = max_layer_classes
+        self.hidden_dim        = H
+        self._max_layer_classes = max_layer_classes
 
         self.input_proj = nn.Sequential(
             nn.Linear(feature_dim, H), nn.ReLU(), nn.Linear(H, H),
@@ -137,24 +157,18 @@ class NextBrickModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        self.b_head = nn.Sequential(
+        self.advance_head = nn.Sequential(
             nn.Linear(H, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 2),
-        )
-        self.layer_head = nn.Sequential(
-            nn.Linear(H, 64), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(64, max_layer_classes),
         )
         self.ss_head = nn.Sequential(
             nn.Linear(H, 64), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(64, N_SUPPORT_STATES),
         )
-
-        self.s1_score_head = nn.Linear(2 * H + 2, 1)
-        self.s2_score_head = nn.Linear(3 * H + 2, 1)
         self.no_support_emb = nn.Parameter(torch.randn(H) * 0.02)
 
+        # proj_head input: scene(H) | s1_emb(H) | s2_emb(H) | layer_norm(1)
         self.proj_head = nn.Sequential(
-            nn.Linear(3 * H + 2, 128), nn.ReLU(), nn.Linear(128, PROJ_DIM),
+            nn.Linear(3 * H + 1, 128), nn.ReLU(), nn.Linear(128, PROJ_DIM),
         )
 
     def _encode(self, tokens, mask):
@@ -170,59 +184,42 @@ class NextBrickModel(nn.Module):
         B, L, _ = token_embs.shape
         absent = idx >= L
         safe   = idx.clamp(0, L - 1)
-        emb    = token_embs[torch.arange(B, device=token_embs.device), safe]
+        emb    = token_embs[torch.arange(B, device=token_embs.device), safe].clone()
         no_emb = self.no_support_emb.unsqueeze(0).expand(B, -1)
         emb[absent] = no_emb[absent]
         return emb
 
     def forward(
         self,
-        tokens,
-        mask,
-        sup_mask,
-        cond_b=None,
-        cond_layer=None,
-        cond_s1=None,
-        cond_s2=None,
+        tokens,           # (B, L, FEATURE_DIM)
+        mask,             # (B, L)  True = real token
+        sup_mask,         # (B, L)  True = support-layer candidate (unused in forward)
+        cond_layer=None,  # (B,) long — teacher forcing / inference conditioning
+        cond_s1=None,     # (B,) long — teacher forcing s1 index
+        cond_s2=None,     # (B,) long — teacher forcing s2 index
     ):
-        _, L, _ = tokens.shape
         scene, token_embs = self._encode(tokens, mask)
 
-        b_logits     = self.b_head(scene)
-        layer_logits = self.layer_head(scene)
-        ss_logits    = self.ss_head(scene)
+        advance_logits = self.advance_head(scene)   # (B, 2)
+        ss_logits      = self.ss_head(scene)         # (B, N_SUPPORT_STATES)
 
-        b_scalar = (cond_b.float() if cond_b is not None
-                    else b_logits.argmax(-1).float()).unsqueeze(-1)
-        layer_scalar = ((cond_layer.float() if cond_layer is not None
-                         else layer_logits.argmax(-1).float())
-                        / max(self.n_layers_cls - 1, 1)).unsqueeze(-1)
+        layer_scalar = (
+            cond_layer.float() if cond_layer is not None
+            else advance_logits.argmax(-1).float()
+        ) / max(self._max_layer_classes - 1, 1)
+        layer_scalar = layer_scalar.unsqueeze(-1)    # (B, 1)
 
-        scene_bc = scene.unsqueeze(1).expand(-1, L, -1)
-        b_bc     = b_scalar.unsqueeze(1).expand(-1, L, -1)
-        lyr_bc   = layer_scalar.unsqueeze(1).expand(-1, L, -1)
+        if cond_s1 is not None:
+            s1_emb = self._gather_support_emb(token_embs, cond_s1)
+            s2_emb = self._gather_support_emb(token_embs, cond_s2)
+        else:
+            s1_emb = self.no_support_emb.unsqueeze(0).expand(scene.shape[0], -1)
+            s2_emb = self.no_support_emb.unsqueeze(0).expand(scene.shape[0], -1)
 
-        s1_inp    = torch.cat([token_embs, scene_bc, b_bc, lyr_bc], dim=-1)
-        s1_logits = self.s1_score_head(s1_inp).squeeze(-1)
-        s1_logits = s1_logits.masked_fill(~sup_mask, float('-inf'))
-        s1_logits = s1_logits.masked_fill(~mask,     float('-inf'))
-
-        s1_idx = cond_s1 if cond_s1 is not None else s1_logits.argmax(-1)
-        s1_emb = self._gather_support_emb(token_embs, s1_idx)
-
-        s1_emb_bc = s1_emb.unsqueeze(1).expand(-1, L, -1)
-        s2_inp    = torch.cat([token_embs, scene_bc, b_bc, lyr_bc, s1_emb_bc], dim=-1)
-        s2_logits = self.s2_score_head(s2_inp).squeeze(-1)
-        s2_logits = s2_logits.masked_fill(~sup_mask, float('-inf'))
-        s2_logits = s2_logits.masked_fill(~mask,     float('-inf'))
-
-        s2_idx = cond_s2 if cond_s2 is not None else s2_logits.argmax(-1)
-        s2_emb = self._gather_support_emb(token_embs, s2_idx)
-
-        proj_inp = torch.cat([scene, s1_emb, s2_emb, b_scalar, layer_scalar], dim=-1)
+        proj_inp = torch.cat([scene, s1_emb, s2_emb, layer_scalar], dim=-1)  # (B, 3H+1)
         proj     = self.proj_head(proj_inp)
 
-        return b_logits, layer_logits, ss_logits, s1_logits, s2_logits, proj
+        return advance_logits, ss_logits, proj
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -294,27 +291,36 @@ def decode_pose_from_projections(support_state, s1_pose, s2_pose,
 def encode_brick(pose_5d, layer_id, time_index,
                  context_poses, context_layer_ids,
                  norm_stats, max_layer=MAX_LAYER_NORM):
-    """17-dim feature vector for one brick token."""
+    """16-dim feature vector for one brick token (matches training_SST_sequential2.ipynb)."""
     ns = norm_stats
     x, y, z, b, r = float(pose_5d[0]), float(pose_5d[1]), float(pose_5d[2]), int(pose_5d[3]), float(pose_5d[4])
-    r_c   = canonicalize_r(r)
+    r_c    = canonicalize_r(r)
     std_xy = (ns["std_x"] + ns["std_y"]) / 2.0
 
     max_ctx_lid = max(context_layer_ids, default=layer_id)
     max_ctx_lid = max(max_ctx_lid, layer_id)
 
-    feat = [
-        (x - ns["mean_x"]) / ns["std_x"],
-        (y - ns["mean_y"]) / ns["std_y"],
-        float(b), math.sin(r_c), math.cos(r_c),
-        layer_id / max_layer,
-        time_index / MAX_BRICKS,
-    ]
+    # Relative coordinates — centroid of context bricks (or self if no context)
+    if context_poses:
+        cx = sum(p[0] for p in context_poses) / len(context_poses)
+        cy = sum(p[1] for p in context_poses) / len(context_poses)
+    else:
+        cx, cy = x, y
+    rel_x = (x - cx) / std_xy
+    rel_y = (y - cy) / std_xy
+
+    # Base pose (5)
+    feat = [rel_x, rel_y, float(b), math.sin(r_c), math.cos(r_c)]
+    # Relative age (1): 0 for the most recently placed brick in the current context
+    rel_age = (len(context_poses) - time_index) / float(MAX_LAYER_NORM * 3)
+    feat.append(rel_age)
+    # Layer state (3)
     feat += [
         (max_ctx_lid - layer_id) / max(max_ctx_lid, 1),
         float(layer_id == max_ctx_lid),
         float(layer_id == max_ctx_lid - 1),
     ]
+    # Same-layer occupancy (5)
     same = [context_poses[i] for i in range(len(context_poses))
             if context_layer_ids[i] == layer_id]
     if same:
@@ -326,8 +332,10 @@ def encode_brick(pose_5d, layer_id, time_index,
         is_frontier = 1.0
     feat += [len(same) / 12.0, ndx / ns["std_x"], ndy / ns["std_y"],
              ndist / std_xy, is_frontier]
+    # Geometry (1)
     half_span = (BRICK_W if b == 0 else BRICK_D) / 2.0
     feat.append(half_span / std_xy)
+    # Support context (1)
     num_sup = sum(1 for lid in context_layer_ids if lid == layer_id - 1)
     feat.append(min(num_sup, 10) / 10.0)
 
@@ -347,11 +355,12 @@ def snap_z(layer_id, z_lookup):
 
 def sample_candidates(model, history_5d, norm_stats, n_candidates, device, z_lookup):
     """
-    3-pass staged inference for the COG-aware model.
+    3-pass staged inference matching training_SST_sequential2.ipynb.
 
-    Pass 1: predict b, layer_id, support_state
-    Pass 2: select s1, s2 (conditioned on b, layer)
-    Pass 3: predict projection mean + add Gaussian noise → decode pose
+    Pass 1: advance_head → pred_advance → derive pred_layer, pred_b (period-3), pred_z
+            ss_head → pred_ss
+    Pass 2: heuristic support selection — random s1 from nearby, nearest s2
+    Pass 3: proj_head conditioned on (layer, s1, s2) → sample noise → decode pose
 
     Returns (candidates, pred_b, pred_layer, pred_ss).
     """
@@ -373,47 +382,68 @@ def sample_candidates(model, history_5d, norm_stats, n_candidates, device, z_loo
     tokens = tokens.to(device)
     mask   = mask.to(device)
 
-    # ── Pass 1: discrete predictions ─────────────────────────────────────────
+    # ── Pass 1: advance → derive layer / b / z  +  support state ─────────────
     dummy_sup = torch.zeros(1, MAX_BRICKS, dtype=torch.bool, device=device)
     with torch.no_grad():
-        b_logits, layer_logits, ss_logits, _, _, _ = model(tokens, mask, dummy_sup)
+        advance_logits, ss_logits, _ = model(tokens, mask, dummy_sup)
 
-    pred_b     = int(b_logits[0].argmax())
-    pred_layer = int(layer_logits[0].argmax())
-    pred_ss    = int(ss_logits[0].argmax())
-    pred_z     = snap_z(pred_layer, z_lookup)
+    pred_advance   = int(advance_logits[0].argmax())
+    max_hist_layer = max(layer_ids) if layer_ids else -1
+    pred_layer     = max(0, max_hist_layer + pred_advance)
+    pred_b         = b_from_layer(pred_layer)
+    pred_z         = snap_z(pred_layer, z_lookup)
+    pred_ss        = int(ss_logits[0].argmax())
 
+    # ── Pass 2: heuristic support selection ───────────────────────────────────
+    prev_layer  = pred_layer - 1
+    sup_indices = [i for i, lid in enumerate(layer_ids[:MAX_BRICKS]) if lid == prev_layer]
+
+    pred_s1, pred_s2 = -1, -1
+    s1_pose,  s2_pose = None, None
+
+    if pred_ss > 0 and sup_indices:
+        if history_5d:
+            avg_x = float(np.mean([p[0] for p in history_5d]))
+            avg_y = float(np.mean([p[1] for p in history_5d]))
+        else:
+            avg_x = avg_y = 0.0
+
+        nearby = [
+            i for i in sup_indices
+            if math.sqrt((history_5d[i][0] - avg_x) ** 2 +
+                         (history_5d[i][1] - avg_y) ** 2) < SUPPORT_RADIUS_M * 3
+        ] or sup_indices
+
+        if nearby:
+            pred_s1 = int(np.random.choice(nearby))
+            s1_pose = history_5d[pred_s1]
+
+            if pred_ss == 2 and len(nearby) > 1:
+                s1_xy  = [s1_pose[0], s1_pose[1]]
+                others = [
+                    (i, (history_5d[i][0] - s1_xy[0]) ** 2 +
+                        (history_5d[i][1] - s1_xy[1]) ** 2)
+                    for i in nearby if i != pred_s1
+                ]
+                if others:
+                    pred_s2 = min(others, key=lambda kv: kv[1])[0]
+                    s2_pose = history_5d[pred_s2]
+
+    # ── Pass 3: proj_head conditioned on s1/s2 → decode ─────────────────────
     sup_mask = torch.zeros(1, MAX_BRICKS, dtype=torch.bool, device=device)
-    for i, lid in enumerate(layer_ids[:MAX_BRICKS]):
-        if lid == pred_layer - 1:
-            sup_mask[0, i] = True
+    for i in sup_indices:
+        sup_mask[0, i] = True
 
-    b_t     = torch.tensor([pred_b],     dtype=torch.long, device=device)
     layer_t = torch.tensor([pred_layer], dtype=torch.long, device=device)
+    s1_t    = torch.tensor(
+        [pred_s1 if pred_s1 >= 0 else MAX_BRICKS], dtype=torch.long, device=device)
+    s2_t    = torch.tensor(
+        [pred_s2 if pred_s2 >= 0 else MAX_BRICKS], dtype=torch.long, device=device)
 
-    # ── Pass 2: support selection ─────────────────────────────────────────────
     with torch.no_grad():
-        _, _, _, s1_logits, s2_logits, proj_mean = model(
-            tokens, mask, sup_mask, cond_b=b_t, cond_layer=layer_t,
-        )
+        _, _, proj_mean = model(tokens, mask, sup_mask,
+                                cond_layer=layer_t, cond_s1=s1_t, cond_s2=s2_t)
 
-    valid_sup = (sup_mask & mask)[0]
-
-    s1_sc = s1_logits[0].clone()
-    s1_sc[~valid_sup] = float('-inf')
-    pred_s1 = int(s1_sc.argmax()) if valid_sup.any() else -1
-    s1_pose = history_5d[pred_s1] if pred_s1 >= 0 else None
-
-    s2_sc = s2_logits[0].clone()
-    s2_sc[~valid_sup] = float('-inf')
-    if valid_sup.sum() > 1:
-        pred_s2 = int(s2_sc.argmax())
-        s2_pose = history_5d[pred_s2]
-    else:
-        pred_s2 = -1
-        s2_pose = None
-
-    # ── Pass 3: project → decode ──────────────────────────────────────────────
     mu_proj = proj_mean[0].cpu().numpy()
     sigmas  = np.array(SIGMA_PROJ)
 
@@ -427,7 +457,7 @@ def sample_candidates(model, history_5d, norm_stats, n_candidates, device, z_loo
             ly = [h[1] for h in history_5d] or [0.0]
             x  = float(np.mean(lx)) + np.random.randn() * 0.02
             y  = float(np.mean(ly)) + np.random.randn() * 0.02
-            r  = canonicalize_r(np.random.uniform(0, math.pi))
+            r  = canonicalize_r(float(np.random.uniform(0, math.pi)))
         else:
             result = decode_pose_from_projections(
                 pred_ss, s1_pose, s2_pose, alpha_A, perp_A, alpha_B, perp_B,
@@ -701,7 +731,7 @@ def main():
     )
     parser.add_argument(
         "--checkpoint",
-        default="training_data/trained_models/best_model_cog_aware.pth",
+        default="training_data/trained_models/latest_model_cog_aware.pth",
     )
     parser.add_argument("--max-bricks",   type=int, default=30)
     parser.add_argument("--n-candidates", type=int, default=100)
@@ -725,18 +755,20 @@ def main():
     ckpt              = torch.load(ckpt_path, map_location=device)
     norm_stats        = ckpt["norm_stats"]
     z_lookup          = {int(k): float(v) for k, v in ckpt["z_lookup"].items()}
-    max_layer_classes = int(ckpt.get("max_layer_classes", 13))
+    max_layer_classes = int(ckpt.get("max_layer_classes", 12))
+    feature_dim       = int(ckpt.get("feature_dim", FEATURE_DIM))
+    hidden_dim        = int(ckpt.get("hidden_dim", HIDDEN_DIM))
 
     model = NextBrickModel(
-        feature_dim=int(ckpt.get("feature_dim", FEATURE_DIM)),
-        hidden_dim=int(ckpt.get("hidden_dim", HIDDEN_DIM)),
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
         max_layer_classes=max_layer_classes,
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     print(f"Loaded {ckpt_path.name}  epoch={ckpt.get('epoch','?')}  "
           f"val_loss={ckpt.get('val_loss', float('nan')):.4f}  "
-          f"max_layer_classes={max_layer_classes}")
+          f"feature_dim={feature_dim}  max_layer_classes={max_layer_classes}")
     for lid, z_val in sorted(z_lookup.items()):
         print(f"  layer {lid:2d}: z = {z_val:.6f} m")
 

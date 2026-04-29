@@ -67,7 +67,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-insta
     "scipy" \
     "protobuf==6.31.1" \
     "rhino3dm" \
-    "opencv-contrib-python-headless"
+    "opencv-contrib-python-headless" \
+    "pyrealsense2"
 
 # PyTorch CPU-only (no GPU in this container)
 RUN python3 -m pip install --no-cache-dir --break-system-packages \

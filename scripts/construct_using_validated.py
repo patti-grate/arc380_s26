@@ -1129,7 +1129,7 @@ def run_construction(
 
     #if real mode, get supply block from camera
     if mode == MODE_REAL:
-        
+        pass
 
     # Override supply z for real mode: physical bricks sit higher than sim model.
     effective_supply_xyz = supply_xyz

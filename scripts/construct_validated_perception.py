@@ -67,15 +67,6 @@ try:
     sys.path.insert(0, os.path.dirname(__file__))
     from trajectory_planner_draft_JG import PlanAndExecuteClient
 
-    try:
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "examples"))
-        from egm_example import EGMClient
-
-        HAVE_EGM = True
-    except ImportError as e2:
-        HAVE_EGM = False
-        print(f"WARNING: egm_example not importable ({e2}). Real robot mode disabled.")
-
     HAVE_ROS2 = True
 except ImportError as e:
     HAVE_ROS2 = False
@@ -241,7 +232,6 @@ _WORLD_NAME = "irb120_workcell"
 MODE_DRY_RUN = "dry_run"  # plan only, no motion
 MODE_SIM = "sim"  # plan + execute in Gazebo simulation
 MODE_REAL = "real"  # plan + execute on real robot hardware
-MODE_HYBRID = "hybrid"  # plan in Gazebo simulation, execute on real robot via EGM
 
 # Real robot gripper is physically mounted +45° (π/4 rad) around the joint_6 axis
 # relative to the sim URDF model. Subtract this offset from all joint_6 positions
@@ -999,37 +989,23 @@ def execute_brick_sequence(
     mode: str,
     gz_spawn_callable,
     gz_spawn_args,
-    exec_node=None,
 ) -> bool:
     """
     Execute the pre-planned trajectories.
     Handles gripper commands and Gazebo visual spawning.
-
-    exec_node : when provided (hybrid mode), all trajectory execution and gripper
-                commands are sent to this node instead of ``node``.  The j6
-                mounting offset is applied automatically since trajectories were
-                planned against the sim TCP frame (gripper_tcp).
     """
     dry_run = mode == MODE_DRY_RUN
     if node is None:
         return True
 
-    # In hybrid mode, planning used the sim TCP frame (gripper_tcp); the real
-    # gripper is mounted 45° offset so we must shift joint_6 before sending.
-    _exec_node = exec_node if exec_node is not None else node
-    _apply_real_offset = exec_node is not None  # only for sim-planned → real-exec
-
     def _exec(label: str, traj) -> bool:
         if dry_run:
             return True
-        traj_to_send = traj
-        if _apply_real_offset:
-            traj_to_send = _apply_j6_offset(traj, REAL_GRIPPER_J6_OFFSET_RAD)
-        return _exec_node.execute_moveit_trajectory(traj_to_send)
+        return node.execute_moveit_trajectory(traj)
 
     def _gripper(position: float, max_velocity: float) -> None:
         if not dry_run:
-            _exec_node.send_gripper_command(position=position, max_velocity=max_velocity)
+            node.send_gripper_command(position=position, max_velocity=max_velocity)
 
     # 0. Open gripper
     _gripper(0.0, 0.05)
@@ -1147,7 +1123,6 @@ def run_construction(
     use_perception: bool = True,
     perception_script: Optional[str] = None,
     supply_json: Optional[str] = None,
-    exec_node=None,
 ) -> None:
     """
     Perception-integrated construction loop.
@@ -1172,7 +1147,6 @@ def run_construction(
         MODE_DRY_RUN: "DRY-RUN (planning only, no execution)",
         MODE_SIM: "SIM    (plan + execute in Gazebo simulation)",
         MODE_REAL: "REAL   (plan + execute on real robot)",
-        MODE_HYBRID: "HYBRID (plan in simulation, execute on real robot via EGM)",
     }.get(mode, mode)
     print(f"[construct] Mode: {mode_label}\n")
 
@@ -1190,11 +1164,8 @@ def run_construction(
             position_xyz=(0.0, 0.0, -0.02),
         )
 
-    # Execution node: in hybrid mode planning (node) and execution (exec_node) are separate.
-    _exec_node = exec_node if exec_node is not None else node
-
     # Ensure the robot is physically at the exact SAFE_HOME_POSITIONS before any plans run
-    if node is not None and mode in [MODE_SIM, MODE_REAL, MODE_HYBRID]:
+    if node is not None and mode in [MODE_SIM, MODE_REAL]:
         print(
             "[construct] Physically aligning to SAFE_HOME to initialize geometric baseline..."
         )
@@ -1213,13 +1184,9 @@ def run_construction(
             if not init_traj:
                 print(f"[construct][WARN] SAFE_HOME plan failed (attempt {home_attempt + 1}/5).")
                 break
-            # Hybrid: apply j6 offset and send via EGM node; skip sim execution.
-            traj_for_exec = init_traj
-            if mode == MODE_HYBRID:
-                traj_for_exec = _apply_j6_offset(init_traj, REAL_GRIPPER_J6_OFFSET_RAD)
-            ok = _exec_node.execute_moveit_trajectory(traj_for_exec)
+            ok = node.execute_moveit_trajectory(init_traj)
             if ok:
-                _exec_node.send_gripper_command(position=0.011, max_velocity=0.05)
+                node.send_gripper_command(position=0.011, max_velocity=0.05)
                 homed = True
                 break
             print(
@@ -1239,7 +1206,7 @@ def run_construction(
         # Step 1: Home the robot between bricks (skip for very first brick
         # which was already homed above, but home again for safety on real).
         # ----------------------------------------------------------------
-        if brick_idx > 0 and node is not None and mode in [MODE_SIM, MODE_REAL, MODE_HYBRID]:
+        if brick_idx > 0 and node is not None and mode in [MODE_SIM, MODE_REAL]:
             print("[construct] Homing robot before next brick...")
             home_traj = node.plan_gripper_to_joint_positions(
                 group_name="arm",
@@ -1252,10 +1219,7 @@ def run_construction(
                 num_attempts=5,
             )
             if home_traj:
-                traj_for_exec = home_traj
-                if mode == MODE_HYBRID:
-                    traj_for_exec = _apply_j6_offset(home_traj, REAL_GRIPPER_J6_OFFSET_RAD)
-                _exec_node.execute_moveit_trajectory(traj_for_exec)
+                node.execute_moveit_trajectory(home_traj)
             else:
                 print("[construct][WARN] Could not plan home trajectory; continuing anyway.")
 
@@ -1424,7 +1388,7 @@ def run_construction(
             f"\n  Supply: xyz=({best_supply_7d[0]:.4f}, {best_supply_7d[1]:.4f}, {best_supply_7d[2]:.4f})"
             f"\n  Goal:   xyz=({best_goal_7d[0]:.4f}, {best_goal_7d[1]:.4f}, {best_goal_7d[2]:.4f})"
         )
-        if mode in [MODE_REAL, MODE_SIM, MODE_HYBRID]:
+        if mode in [MODE_REAL, MODE_SIM]:
             confirm = input("  Execute this brick? [y/N/skip/abort]: ").strip().lower()
             if confirm == "skip":
                 print("  [USER] Skipping brick.")
@@ -1445,7 +1409,6 @@ def run_construction(
             mode,
             gz_spawn_callable=None,
             gz_spawn_args=None,
-            exec_node=exec_node,
         )
 
         if not exec_ok:
@@ -1770,18 +1733,6 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Execute trajectories on the real robot (CAUTION: moves hardware)",
     )
-    mode_group.add_argument(
-        "--hybrid",
-        action="store_true",
-        default=False,
-        help=(
-            "Plan each brick's trajectory in Gazebo simulation (full collision/joint "
-            "checking), then immediately execute on the real robot via EGM. "
-            "Perception is used per-brick to detect the actual supply pose. "
-            "Requires both Gazebo+MoveIt and the EGM controller to be running."
-        ),
-    )
-
     p.add_argument(
         "--grasp-id",
         default=None,
@@ -1900,50 +1851,20 @@ def main() -> None:
         mode = MODE_REAL
     elif args.sim:
         mode = MODE_SIM
-    elif args.hybrid:
-        mode = MODE_HYBRID
     else:
         mode = MODE_DRY_RUN
 
     # -- ROS 2 / MoveIt setup -----------------------------------------------
     node = None
-    exec_node = None  # separate EGM execution node for hybrid mode
     if HAVE_ROS2:
         rclpy.init()
         if mode == MODE_REAL:
-            # PlanAndExecuteClient(mode="real") uses EGM execution AND correct
-            # use_sim_time=False — preferred over the standalone EGMClient for
-            # single-node real-robot use.
             node = PlanAndExecuteClient(  # type: ignore[name-defined]
                 mode="real",
                 max_velocity_scaling=args.speed_real,
                 max_acceleration_scaling=args.speed_real,
             )
             print(f"[construct] PlanAndExecuteClient ready (real mode, speed={args.speed_real}).")
-        elif mode == MODE_HYBRID:
-            if not HAVE_EGM:
-                print(
-                    "ERROR: --hybrid requires abb_egm_interfaces (EGMClient unavailable). "
-                    "Ensure the package is installed inside the Docker container."
-                )
-                sys.exit(1)
-            # Sim planning node: full Gazebo + MoveIt collision/joint checking.
-            node = PlanAndExecuteClient(  # type: ignore[name-defined]
-                mode="sim",
-                max_velocity_scaling=args.speed_sim,
-                max_acceleration_scaling=args.speed_sim,
-            )
-            # Real execution node: sends trajectories to the EGM action server.
-            # use_sim_time=False so system clock is used (no Gazebo /clock needed).
-            exec_node = EGMClient(  # type: ignore[name-defined]
-                max_velocity_scaling=args.speed_real,
-                max_acceleration_scaling=args.speed_real,
-                use_sim_time=False,
-            )
-            print(
-                f"[construct] HYBRID mode: sim planning (speed={args.speed_sim}) + "
-                f"real EGM execution (speed={args.speed_real})."
-            )
         else:
             v_scale = args.speed_sim if mode == MODE_SIM else 0.2
             node = PlanAndExecuteClient(  # type: ignore[name-defined]
@@ -2002,10 +1923,9 @@ def main() -> None:
         for pose in demo_poses:
             pose[2] += args.structure_z_offset
 
-    # In non-sim/non-hybrid modes, clear any leftover MoveIt collision objects.
-    # (In sim/hybrid mode _gz_clean_scene() handles this inside run_construction,
-    #  or the sim node's planning scene is fresh on startup.)
-    if node is not None and mode not in [MODE_SIM, MODE_HYBRID]:
+    # In non-sim modes, clear any leftover MoveIt collision objects.
+    # (In sim mode _gz_clean_scene() handles this inside run_construction.)
+    if node is not None and mode != MODE_SIM:
         node.remove_all_world_collision_objects()
 
     # Resolve export directory: explicit override > auto-derived sibling > disabled
@@ -2043,7 +1963,6 @@ def main() -> None:
             use_perception=use_perception,
             perception_script=perception_script,
             supply_json=supply_json,
-            exec_node=exec_node,
         )
     finally:
         if node is not None:
@@ -2051,11 +1970,7 @@ def main() -> None:
             for _ in range(60):
                 rclpy.spin_once(node, timeout_sec=0.05)
             node.destroy_node()
-        if exec_node is not None:
-            for _ in range(60):
-                rclpy.spin_once(exec_node, timeout_sec=0.05)
-            exec_node.destroy_node()
-        if HAVE_ROS2 and (node is not None or exec_node is not None):
+        if HAVE_ROS2 and node is not None:
             rclpy.shutdown()
             print("[construct] ROS 2 shutdown complete.")
 

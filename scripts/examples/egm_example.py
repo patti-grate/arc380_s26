@@ -143,7 +143,6 @@ class EGMClient(Node):
         oc.orientation.z = float(qz)
         oc.orientation.w = float(qw)
 
-
         oc.absolute_x_axis_tolerance = float(tolerance_rpy[0])
         oc.absolute_y_axis_tolerance = float(tolerance_rpy[1])
         oc.absolute_z_axis_tolerance = float(tolerance_rpy[2])
@@ -246,10 +245,12 @@ class EGMClient(Node):
                 tolerance_rpy=ori_tolerance_rpy,
             )
         ]
+        mpr.goal_constraints = [constraints]
 
-        # Add joint constraints if provided
-        joint_constraints = []
-        c_map = {
+        # Joint range limits → PATH constraints (values are tolerances, same as
+        # trajectory_planner_draft_JG.py).  joint_6 is centered at pi to keep it
+        # in the [0, 2pi] range; all others are centered at 0.
+        joint_consts_map = {
             "joint_1": joint_1_constraints,
             "joint_2": joint_2_constraints,
             "joint_3": joint_3_constraints,
@@ -257,25 +258,37 @@ class EGMClient(Node):
             "joint_5": joint_5_constraints,
             "joint_6": joint_6_constraints,
         }
-        for j_name, j_val in c_map.items():
-            if j_val is not None:
-                joint_constraints.append(
-                    self._make_joint_constraint(j_name, j_val, tolerance_above=0.1, tolerance_below=0.1)
-                )
-        
-        if lock_wrist_to_start and start_joint_names and start_joint_positions:
-            s_map = dict(zip(start_joint_names, start_joint_positions))
-            for j_name in ["joint_4", "joint_5", "joint_6"]:
-                if j_name in s_map:
-                    joint_constraints.append(
-                        self._make_joint_constraint(j_name, s_map[j_name], tolerance_above=lock_wrist_tolerance, tolerance_below=lock_wrist_tolerance)
+        active_consts = {k: v for k, v in joint_consts_map.items() if v is not None}
+        if active_consts:
+            import math as _math
+            path_c = Constraints()
+            for jname, val in active_consts.items():
+                target_pos = _math.pi if jname == "joint_6" else 0.0
+                path_c.joint_constraints.append(
+                    self._make_joint_constraint(
+                        joint_name=jname,
+                        position=target_pos,
+                        tolerance_above=float(val),
+                        tolerance_below=float(val),
                     )
+                )
+            mpr.path_constraints = path_c
 
-        if joint_constraints:
-            constraints.joint_constraints = joint_constraints
-
-        mpr.goal_constraints = [constraints]
-
+        if lock_wrist_to_start and start_joint_names and start_joint_positions:
+            if not mpr.path_constraints.joint_constraints:
+                mpr.path_constraints = Constraints()
+            path_c = mpr.path_constraints
+            s_map = dict(zip(start_joint_names, start_joint_positions))
+            for j_name in ["joint_4", "joint_6"]:
+                if j_name in s_map:
+                    path_c.joint_constraints.append(
+                        self._make_joint_constraint(
+                            joint_name=j_name,
+                            position=s_map[j_name],
+                            tolerance_above=lock_wrist_tolerance,
+                            tolerance_below=lock_wrist_tolerance,
+                        )
+                    )
 
         mpr.allowed_planning_time = float(allowed_planning_time)
         mpr.num_planning_attempts = int(num_attempts)
@@ -697,7 +710,7 @@ def main():
         link_name="gripper_tcp_calibrated",
         frame_id="world",
         goal_xyz=(0.0, 0.480, 0.1),
-        goal_quat_wxyz=(0.0, 1.0, 0.0, 0.0),
+        goal_quat_xyzw=(0.0, 1.0, 0.0, 0.0),
         max_velocity_scaling=0.5,            
     )
     if arm_traj is not None:
@@ -708,7 +721,7 @@ def main():
         link_name="gripper_tcp_calibrated",
         frame_id="world",
         goal_xyz=(0.0, 0.480, 0.032),
-        goal_quat_wxyz=(0.0, 1.0, 0.0, 0.0),
+        goal_quat_xyzw=(0.0, 1.0, 0.0, 0.0),
         max_velocity_scaling=0.5,
     )
     if arm_traj is not None:
@@ -724,7 +737,7 @@ def main():
         link_name="gripper_tcp_calibrated",
         frame_id="world",
         goal_xyz=(0.0, 0.480, 0.1),
-        goal_quat_wxyz=(0.0, 1.0, 0.0, 0.0),
+        goal_quat_xyzw=(0.0, 1.0, 0.0, 0.0),
         max_velocity_scaling=0.5,
     )
     if arm_traj is not None:

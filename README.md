@@ -104,34 +104,28 @@ python3 scripts/construct_using_validated.py --batch batch1 --demo demo_0 --stru
 
 ### 3b. Perception-Integrated Construction (`construct_validated_perception.py`)
 
-Operator-guided construction where the robot stops between each brick and uses the RealSense camera to detect the supply brick's exact pose before planning. Supports three execution modes.
+Operator-guided construction where the robot stops between each brick and uses the RealSense camera to detect the supply brick's exact pose before planning.
 
 #### Execution Modes
 
 | Mode | Flag | Description |
 | :--- | :--- | :--- |
 | **Dry-Run** | (default) | Plans trajectories using perceived pose, reports pass/fail. No motion. |
-| **Real** | `--real` | Perceives supply pose, plans with MoveIt (collision/joint checking against the planning scene), executes on the real robot via EGM. |
-| **Hybrid** | `--hybrid` | Perceives supply pose, plans each brick in **Gazebo simulation** (full collision/joint checking with physics), then immediately executes the validated trajectory on the real robot via EGM. |
+| **Real** | `--real` | Perceives supply pose, plans with MoveIt, executes on the real robot via EGM. |
 | **Sim** | `--sim` | Plans and executes entirely in Gazebo. Exports trajectories for later replay. |
 | **Replay** | `--replay` | Loads a pre-planned `planned_sequence.json` and replays it on the real robot. |
 
-#### Per-Brick Workflow (Real / Hybrid modes)
+#### Per-Brick Workflow (Real mode)
 
 1. **Home** — robot moves to `SAFE_HOME` between every brick.
 2. **Prompt** — operator places the next brick in the supply area and presses Enter.
 3. **Detect** — `perception_simple.py` captures a frame, runs ArUco-based perspective correction + k-means colour segmentation + `minAreaRect`, and writes `supply.json` with the detected pose.
-4. **Plan** — MoveIt plans all 7 trajectory phases (hover → grasp → lift → transit → place → retract → home) using the detected pose. In `--hybrid`, planning runs inside Gazebo for full physics-backed collision checking.
+4. **Plan** — MoveIt plans all 7 trajectory phases (hover → grasp → lift → transit → place → retract → home) using the detected pose.
 5. **Confirm** — plan summary (grasp id, supply xyz, goal xyz) is shown; operator types `y / skip / abort`.
-6. **Execute** — robot executes the validated trajectory. In `--hybrid`, the sim-planned trajectory is sent to the real robot via EGM with the gripper j6 mounting offset applied automatically.
+6. **Execute** — robot executes the validated trajectory via EGM.
 7. **Register** — the placed brick is added to the MoveIt planning scene so subsequent bricks plan around it.
 
 #### Commands
-
-**Hybrid mode — perceive + plan in sim + execute on real (recommended for best collision checking):**
-```bash
-python3 scripts/construct_validated_perception.py --demo demo_0 --hybrid --structure-z-offset 0.004
-```
 
 **Real mode — perceive + plan with MoveIt scene + execute on real:**
 ```bash
@@ -165,8 +159,7 @@ python3 scripts/construct_validated_perception.py --demo demo_0 --real \
 | :--- | :--- | :--- |
 | `--demo` | `demo_0` | Demo name in `validated_simPhysics/` |
 | `--batch` | `batch1` | Batch folder inside `training_data/` |
-| `--real` | off | Execute on the physical robot (MoveIt planning scene only) |
-| `--hybrid` | off | Plan in Gazebo simulation, execute on real robot via EGM |
+| `--real` | off | Execute on the physical robot |
 | `--sim` | off | Plan and execute entirely in Gazebo |
 | `--replay` | off | Replay a pre-planned JSON sequence (accepts file path or demo name) |
 | `--skip-perception` | off | Use `--supply-xyz` instead of camera detection |
@@ -174,13 +167,11 @@ python3 scripts/construct_validated_perception.py --demo demo_0 --real \
 | `--hover-z` | `0.12` | Hover height above pick/place poses (metres) |
 | `--grasp-id` | auto | Force a specific grasp variant |
 | `--structure-z-offset` | `0.0` | Vertical offset applied to all goal poses (metres) |
-| `--speed-sim` | `0.5` | Velocity scaling for simulation planning (used as planning speed in `--hybrid`) |
+| `--speed-sim` | `0.5` | Velocity scaling for simulation planning |
 | `--speed-real` | `0.13` | Velocity scaling for real robot EGM execution |
 | `--speed-replay` | `1.0` | Execution speed multiplier for `--replay` mode |
 | `--no-export` | off | Disable automatic trajectory export after a successful sim run |
 | `--export-dir` | auto | Override the export directory for planned trajectories |
-
-> **`--hybrid` vs `--real`:** Both modes run full MoveIt collision and joint-limit checking. `--hybrid` additionally runs planning inside Gazebo with physics-settled collision geometry and provides visual confirmation before real execution — use it when collision checking fidelity matters. `--real` is faster (no Gazebo overhead) and suitable when the planning scene is trusted to be accurate.
 
 ---
 
